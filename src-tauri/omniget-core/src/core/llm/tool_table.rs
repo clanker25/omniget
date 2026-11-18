@@ -1,0 +1,368 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{OnceLock, RwLock};
+
+use async_trait::async_trait;
+use serde::Serialize;
+use serde_json::{json, Value};
+
+use super::types::ToolSpec;
+use crate::core::washmybelly::Os;
+
+pub type BoxFut = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
+
+pub type CoreCall = fn(Value) -> BoxFut;
+
+#[async_trait]
+pub trait HostTools: Send + Sync {
+    async fn call(&self, name: &str, input: Value) -> Result<Value, String>;
+}
+
+#[derive(Clone, Copy)]
+pub enum ToolImpl {
+    Core(CoreCall),
+    Host,
+}
+
+impl std::fmt::Debug for ToolImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolImpl::Core(_) => f.write_str("Core"),
+            ToolImpl::Host => f.write_str("Host"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostHint {
+    Cheap,
+    Local,
+    Network,
+    Paid,
+}
+
+pub struct ToolEntry {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: Value,
+    pub call: ToolImpl,
+    pub category: &'static str,
+    pub cost_hint: CostHint,
+    pub platforms: &'static [Os],
+    pub feature: Option<&'static str>,
+    pub risk: Option<ToolRisk>,
+    pub always_ask: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolRisk {
+    Read,
+    Reversible,
+    Destructive,
+}
+
+impl ToolEntry {
+    pub fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.to_string(),
+            description: self.description.to_string(),
+            input_schema: self.input_schema.clone(),
+        }
+    }
+
+    pub fn available(&self) -> bool {
+        (self.platforms.is_empty()
+            || self
+                .platforms
+                .contains(&crate::core::washmybelly::current_os()))
+            && self.feature.is_none_or(feature_enabled)
+    }
+}
+
+static DISABLED_FEATURES: RwLock<Vec<&'static str>> = RwLock::new(Vec::new());
+
+pub fn set_feature_enabled(feature: &'static str, on: bool) {
+    if let Ok(mut off) = DISABLED_FEATURES.write() {
+        off.retain(|f| *f != feature);
+        if !on {
+            off.push(feature);
+        }
+    }
+}
+
+pub fn feature_enabled(feature: &str) -> bool {
+    DISABLED_FEATURES
+        .read()
+        .map(|off| !off.contains(&feature))
+        .unwrap_or(true)
+}
+
+pub fn always_asks(name: &str) -> bool {
+    table().iter().any(|e| e.name == name && e.always_ask)
+}
+
+fn obj(props: Value, required: &[&str]) -> Value {
+    json!({ "type": "object", "properties": props, "required": required })
+}
+
+pub fn s(v: &Value, k: &str) -> String {
+    v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+pub fn list(v: &Value, k: &str) -> Vec<String> {
+    v.get(k)
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn num(v: &Value, k: &str) -> Option<u64> {
+    v.get(k).and_then(|x| x.as_u64())
+}
+
+pub fn need_str(v: &Value, k: &str) -> Result<String, String> {
+    let value = s(v, k);
+    if value.trim().is_empty() {
+        return Err(format!("argument \"{}\" is required (string)", k));
+    }
+    Ok(value)
+}
+
+pub fn need_id(v: &Value, k: &str) -> Result<u64, String> {
+    v.get(k)
+        .and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|t| t.trim().parse().ok()))
+        })
+        .ok_or_else(|| format!("argument \"{}\" is required (download id, integer)", k))
+}
+
+pub fn to_json<T: Serialize>(v: T) -> Result<Value, String> {
+    serde_json::to_value(v).map_err(|e| e.to_string())
+}
+
+pub const QUEUE_STATUS_KEYS: &[&str] =
+    &["queued", "active", "paused", "seeding", "complete", "error"];
+
+#[allow(clippy::too_many_arguments)]
+fn entry(
+    name: &'static str,
+    description: &'static str,
+    input_schema: Value,
+    call: ToolImpl,
+    category: &'static str,
+    cost_hint: CostHint,
+) -> ToolEntry {
+    ToolEntry {
+        name,
+        description,
+        input_schema,
+        call,
+        category,
+        cost_hint,
+        platforms: &[],
+        feature: None,
+        risk: None,
+        always_ask: false,
+    }
+}
+
+fn core(f: CoreCall) -> ToolImpl {
+    ToolImpl::Core(f)
+}
+
+fn build() -> Vec<ToolEntry> {
+    use CostHint::{Cheap, Local, Network, Paid};
+    let mut all = vec![
+        entry("omniget_app_export", "Export up to 20 owned PNG/MP4 artifacts as a local ZIP with manifest, storyboard and contact sheet. No remote upload.", obj(json!({"artifactIds":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20},"storyboard":{"type":"string","maxLength":20000}}), &["artifactIds","storyboard"]), ToolImpl::Host, "native_app", Local),
+        entry("omniget_app_record", "Record native WebView snapshots asynchronously at a target of 5 fps, maximum 60 seconds. Requires FFmpeg, app_capture and transfer. No audio/cursor. Start requires a unique requestId. Stop returns immediately; poll status until complete.", obj(json!({"requestId":{"type":"string","minLength":1,"maxLength":100},"action":{"type":"string","enum":["start","status","stop","cancel"]},"windowId":{"type":"string"},"jobId":{"type":"string"}}), &["action"]), ToolImpl::Host, "native_app", Local),
+        entry("omniget_app_catalog", "Discover all native screens, windows and blocked surfaces.", obj(json!({}), &[]), ToolImpl::Host, "native_app", Local),
+        entry("omniget_app_navigate", "Navigate the real main window to a catalog screen (screenId from omniget_app_catalog, e.g. /world). requestId is optional and makes a retry idempotent. Sensitive screens remain blocked for inspection and control.", obj(json!({"requestId":{"type":"string","minLength":1,"maxLength":100},"screenId":{"type":"string"},"windowId":{"type":"string"}}), &["screenId"]), ToolImpl::Host, "native_app", Local),
+        entry("omniget_app_interact", "Use explicitly allowed presentation actions. Never sends messages or grants permissions. Reinspect after every mutation.", obj(json!({"requestId":{"type":"string","minLength":1,"maxLength":100},"windowId":{"type":"string"},"stateRevision":{"type":"string"},"ref":{"type":"string"},"action":{"type":"string","enum":["click","fill","scroll"]},"value":{}}), &["stateRevision","ref","action","requestId"]), ToolImpl::Host, "native_app", Local),
+        entry("omniget_app_capture", "Capture native WebView pixels and return an inline preview plus transferable original. Requires app_capture and transfer. Crop coordinates use CSS pixels.", obj(json!({"windowId":{"type":"string"},"region":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"width":{"type":"number"},"height":{"type":"number"}},"required":["x","y","width","height"],"additionalProperties":false}}), &[]), ToolImpl::Host, "native_app", Local),
+        entry("omniget_app_status", "Inspect native app windows and available capabilities. Requires an authenticated connection with app_observe.", obj(json!({}), &[]), ToolImpl::Host, "native_app", Local),
+        entry("omniget_app_inspect", "Inspect native WebView HTML/ARIA controls with revision-bound refs. Sensitive surfaces are blocked.", obj(json!({"windowId":{"type":"string"},"cursor":{"type":"integer","minimum":0,"maximum":10000},"limit":{"type":"integer","minimum":1,"maximum":200}}), &[]), ToolImpl::Host, "native_app", Local),
+        entry("fs_read", "Read a text file of the workspace with line numbers. A directory path lists it. Use offset/limit for long files.",
+            obj(json!({ "path": { "type": "string" }, "offset": { "type": "integer", "minimum": 1 }, "limit": { "type": "integer", "minimum": 1 } }), &["path"]),
+            core(|a| Box::pin(async move { super::code_tools::fs_read(&a) })), "code", Local),
+        entry("fs_list", "List files and folders of the workspace (skips .git, node_modules, target).",
+            obj(json!({ "path": { "type": "string" }, "depth": { "type": "integer", "minimum": 1, "maximum": 8 } }), &[]),
+            core(|a| Box::pin(async move { super::code_tools::fs_list(&a) })), "code", Local),
+        entry("fs_glob", "Find files by glob pattern (e.g. **/*.rs, src/**/*.{ts,svelte}).",
+            obj(json!({ "pattern": { "type": "string" }, "path": { "type": "string" } }), &["pattern"]),
+            core(|a| Box::pin(async move { super::code_tools::fs_glob(&a) })), "code", Local),
+        entry("fs_grep", "Search file contents by regex; returns path:line: text.",
+            obj(json!({ "pattern": { "type": "string" }, "path": { "type": "string" }, "include": { "type": "string" }, "literal_text": { "type": "boolean" } }), &["pattern"]),
+            core(|a| Box::pin(async move { super::code_tools::fs_grep(&a) })), "code", Local),
+        entry("fs_edit", "Replace old_string with new_string in a file. old_string must match exactly one place unless replace_all is true. Empty old_string creates a new file.",
+            obj(json!({ "path": { "type": "string" }, "old_string": { "type": "string" }, "new_string": { "type": "string" }, "replace_all": { "type": "boolean" } }), &["path", "old_string", "new_string"]),
+            core(|a| Box::pin(async move { super::code_tools::fs_edit(&a) })), "code", Local),
+        entry("fs_write", "Create or overwrite a whole file.",
+            obj(json!({ "path": { "type": "string" }, "content": { "type": "string" } }), &["path", "content"]),
+            core(|a| Box::pin(async move { super::code_tools::fs_write(&a) })), "code", Local),
+        entry("fs_apply_patch", "Apply a multi-file patch in the '*** Begin Patch' envelope (*** Add File / *** Update File with @@ hunks of ' ', '-', '+' lines / *** Delete File / *** End Patch).",
+            obj(json!({ "patch": { "type": "string" } }), &["patch"]),
+            core(|a| Box::pin(async move { super::code_tools::fs_apply_patch(&a) })), "code", Local),
+        entry("shell_exec", "Run a shell command inside the workspace. Sandboxed on macOS: writes only inside the workspace, no network. Runs at the workspace root; paths are relative to it and workdir (optional) is a folder relative to it. Say what the command does in description.",
+            obj(json!({ "command": { "type": "string" }, "description": { "type": "string" }, "workdir": { "type": "string" }, "timeout_ms": { "type": "integer", "minimum": 1000 } }), &["command", "description"]),
+            core(|a| Box::pin(async move { super::code_tools::shell_exec(a).await })), "code", Local),
+        entry("todo_write", "Publish or update the plan for the task: a list of steps with status pending, in_progress or completed.",
+            obj(json!({ "plan": { "type": "array", "items": { "type": "object", "properties": { "step": { "type": "string" }, "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] } }, "required": ["step", "status"] } }, "explanation": { "type": "string" } }), &["plan"]),
+            core(|a| Box::pin(async move { super::code_tools::todo_write(&a) })), "code", Local),
+        entry("kb_search", "Search the project knowledge base (.omniget/kb, markdown notes written by the team of agents): decisions, conventions, how things are run, what was already tried. Search before you explore a codebase you were in before.",
+            obj(json!({ "query": { "type": "string" }, "limit": { "type": "integer", "minimum": 1, "maximum": 20 } }), &["query"]),
+            core(|a| Box::pin(async move { super::kb::kb_search(a).await })), "code", Cheap),
+        entry("kb_write", "Save a note to the project knowledge base so the next agent (or you, tomorrow) does not rediscover it: a decision and its reason, a command that works, a trap. One topic per note; `append` adds to an existing note with the same title.",
+            obj(json!({ "title": { "type": "string" }, "content": { "type": "string", "description": "markdown" }, "append": { "type": "boolean" } }), &["title", "content"]),
+            core(|a| Box::pin(async move { super::kb::kb_write(&a) })), "code", Cheap),
+        entry("agent_delegate", "Hand a self-contained sub-task to another agent of the roster and get its final answer back. The other agent works in the same workspace, with its own tools and budget. Use it for work that fits another role better or can be isolated.",
+            obj(json!({ "agent_id": { "type": "string", "description": "id of the roster agent" }, "task": { "type": "string", "description": "everything the other agent needs to know; it does not see this conversation" } }), &["agent_id", "task"]),
+            ToolImpl::Host, "code", Paid),
+        entry(
+            "download_url",
+            "Queue a URL (video, audio, playlist, image, torrent) in the OmniGet Downloads panel. Same as pasting it in the app.",
+            obj(json!({ "url": { "type": "string" } }), &["url"]),
+            ToolImpl::Host,
+            "downloads",
+            Network,
+        ),
+        entry(
+            "download_enqueue",
+            "Queue a URL in the Downloads panel using the app defaults, and return the queue item. mode audio downloads audio only. Always supply a stable idempotencyKey per user intent; reuse it on retries.",
+            obj(json!({ "url": { "type": "string" }, "mode": { "type": "string", "enum": ["video", "audio"] }, "idempotencyKey": { "type": "string" } }), &["url"]),
+            ToolImpl::Host,
+            "downloads",
+            Network,
+        ),
+        entry(
+            "downloads_queue",
+            "List the Downloads queue with per-item status, progress, speed, ETA and output path.",
+            obj(json!({ "status": { "type": "string", "enum": QUEUE_STATUS_KEYS }, "limit": { "type": "integer" } }), &[]),
+            ToolImpl::Host,
+            "downloads",
+            Cheap,
+        ),
+        entry(
+            "download_status",
+            "One download by id: status, percent, speed, ETA, file path and the last yt-dlp command.",
+            obj(json!({ "download_id": { "type": "integer" } }), &["download_id"]),
+            ToolImpl::Host,
+            "downloads",
+            Cheap,
+        ),
+        entry(
+            "download_cancel",
+            "Cancel a download by id (queued, active, paused or seeding).",
+            obj(json!({ "download_id": { "type": "integer" } }), &["download_id"]),
+            ToolImpl::Host,
+            "downloads",
+            Cheap,
+        ),
+        entry(
+            "download_pause",
+            "Pause an active download by id.",
+            obj(json!({ "download_id": { "type": "integer" } }), &["download_id"]),
+            ToolImpl::Host,
+            "downloads",
+            Cheap,
+        ),
+        entry(
+            "download_resume",
+            "Resume a paused download by id.",
+            obj(json!({ "download_id": { "type": "integer" } }), &["download_id"]),
+            ToolImpl::Host,
+            "downloads",
+            Cheap,
+        ),
+        entry(
+            "catalog_search",
+            "Search the OmniGet catalog of agent components (agents, commands, skills, MCP servers, hooks, settings, statuslines, plugins) that can be installed into Claude Code, Codex, Gemini CLI, Cursor, OpenCode and other coding tools. Returns ids for catalog_get / catalog_plan_install.",
+            obj(json!({ "query": { "type": "string" }, "kinds": { "type": "array", "items": { "type": "string", "enum": ["agent", "command", "skill", "mcp", "hook", "setting", "statusline", "plugin", "rule", "loop", "mod", "template", "sandbox"] } }, "categories": { "type": "array", "items": { "type": "string" } }, "limit": { "type": "integer", "minimum": 1, "maximum": 50 }, "offset": { "type": "integer", "minimum": 0 } }), &[]),
+            ToolImpl::Host,
+            "catalog",
+            Cheap,
+        ),
+        entry(
+            "catalog_get",
+            "One catalog item by id: description, files, license, source, and on which installed coding tools it works (and what is lost in the conversion).",
+            obj(json!({ "id": { "type": "string" }, "project": { "type": "string", "description": "absolute project folder, for project-scoped compatibility" } }), &["id"]),
+            ToolImpl::Host,
+            "catalog",
+            Cheap,
+        ),
+        entry(
+            "catalog_plan_install",
+            "Plan installing catalog items: every file each target tool would get, with a unified diff, conflicts and the commands the install makes a tool run. Writes nothing. Returns a plan_id for catalog_install.",
+            obj(json!({ "ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 }, "targets": { "type": "array", "items": { "type": "string" }, "description": "tool ids (claude, codex, gemini, cursor, opencode…); empty = the installed tools enabled by default" }, "scope": { "type": "string", "enum": ["project", "global", "local"] }, "project": { "type": "string", "description": "absolute project folder (required for scope project)" }, "policy": { "type": "string", "enum": ["rename", "skip", "overwrite"] } }), &["ids"]),
+            ToolImpl::Host,
+            "catalog",
+            Network,
+        ),
+        entry(
+            "catalog_install",
+            "Apply a plan from catalog_plan_install. The owner of this machine is asked first and sees the whole diff; a refusal or no answer fails the call and writes nothing.",
+            obj(json!({ "plan_id": { "type": "string" }, "reason": { "type": "string", "description": "one sentence for the owner: why you need this" } }), &["plan_id"]),
+            ToolImpl::Host,
+            "catalog",
+            Local,
+        ),
+        entry("preview_servers", "List dev servers listening on local TCP ports from inside a folder (lsof/netstat + HTTP probe). Returns port, url, pid, command, cwd, inWorkspace, html, title. Without cwd, every local listener.", obj(json!({"cwd":{"type":"string","description":"Project or worktree folder"},"all":{"type":"boolean","description":"Also list local listeners outside the folder"}}), &[]), ToolImpl::Host, "code", Cheap),
+        entry("preview_navigate", "Open a URL in the thread's Browser preview (opens a hidden preview when none is open) or go back/forward/reload. Waits for the page load and returns {url, title, loading, visible}.", obj(json!({"url":{"type":"string"},"action":{"type":"string","enum":["back","forward","reload"]},"threadId":{"type":"string"}}), &[]), ToolImpl::Host, "code", Local),
+        entry("preview_snapshot", "Accessibility-style snapshot of the preview page: an indented role/name tree whose refs (e12) work as selectors in preview_click/preview_type, plus the visible text (and the HTML with includeHtml).", obj(json!({"threadId":{"type":"string"},"maxNodes":{"type":"integer","maximum":10000},"maxChars":{"type":"integer","maximum":200000},"includeHtml":{"type":"boolean"}}), &[]), ToolImpl::Host, "code", Cheap),
+        entry("preview_click", "Click an element of the preview page. selector: a CSS selector, a ref from preview_snapshot (e12), or text=Label.", obj(json!({"selector":{"type":"string"},"double":{"type":"boolean"},"threadId":{"type":"string"}}), &["selector"]), ToolImpl::Host, "code", Local),
+        entry("preview_type", "Type into an input, textarea, select or contenteditable of the preview page (React-safe value setter + input/change events). clear defaults to true; submit presses Enter and submits the form.", obj(json!({"selector":{"type":"string"},"text":{"type":"string"},"submit":{"type":"boolean"},"clear":{"type":"boolean"},"threadId":{"type":"string"}}), &["selector", "text"]), ToolImpl::Host, "code", Local),
+        entry("preview_console", "Console messages, page errors and failed resource loads captured in the preview since the last page load (drained by default).", obj(json!({"level":{"type":"string","enum":["error","warn","log","info","debug"]},"limit":{"type":"integer","maximum":500},"clear":{"type":"boolean"},"threadId":{"type":"string"}}), &[]), ToolImpl::Host, "code", Cheap),
+        entry("preview_screenshot", "PNG screenshot of the preview page; returns {path, width, height}. Shows the preview for a moment when it is hidden.", obj(json!({"threadId":{"type":"string"}}), &[]), ToolImpl::Host, "code", Local),
+    ];
+    all.extend(crate::core::washmybelly::tools::entries());
+    all.extend(crate::core::global_dl::tools::entries());
+    all.extend(crate::core::telegram::tools::entries());
+    all
+}
+
+pub fn table() -> &'static [ToolEntry] {
+    static TABLE: OnceLock<Vec<ToolEntry>> = OnceLock::new();
+    TABLE.get_or_init(build)
+}
+
+pub fn available() -> impl Iterator<Item = &'static ToolEntry> {
+    table().iter().filter(|e| e.available())
+}
+
+pub fn find(name: &str) -> Option<&'static ToolEntry> {
+    available().find(|e| e.name == name)
+}
+
+pub fn specs() -> Vec<ToolSpec> {
+    available().map(ToolEntry::spec).collect()
+}
+
+pub fn names() -> Vec<&'static str> {
+    available().map(|e| e.name).collect()
+}
+
+pub async fn dispatch(
+    name: &str,
+    input: Value,
+    host: Option<&dyn HostTools>,
+) -> Result<Value, String> {
+    let Some(entry) = find(name) else {
+        return Err(format!("unknown tool: {}", name));
+    };
+    match entry.call {
+        ToolImpl::Core(f) => f(input).await,
+        ToolImpl::Host => match host {
+            Some(host) => host.call(name, input).await,
+            None => Err(format!(
+                "tool \"{}\" needs the desktop app (no host available)",
+                name
+            )),
+        },
+    }
+}

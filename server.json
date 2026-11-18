@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.tonhowtf/omniget",
+  "title": "OmniGet",
+  "description": "Desktop toolbox for coding agents: downloads, files, pages, ports, chats and cleanup, in OmniGet",
+  "version": "1.0.1",
+  "websiteUrl": "https://getomniget.com",
+  "repository": {
+    "url": "https://github.com/tonhowtf/omniget",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/tonhowtf/omniget/releases/download/v1.0.1/omniget-mcp.mcpb",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OMNIGET_MCP_TOKEN",
+          "description": "Token of a connection created in OmniGet under Settings → AI & agents → Connect to other apps → More options. Tool calls return TOKEN_MISSING until it is set.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "OMNIGET_MCP_URL",
+          "description": "Local endpoint (default http://127.0.0.1:47720/mcp)",
+          "isRequired": false,
+          "default": "http://127.0.0.1:47720/mcp"
+        }
+      ]
+    }
+  ]
+}

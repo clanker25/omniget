@@ -1,0 +1,97 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "omniget",
+  "version": "1.0.1",
+  "identifier": "wtf.tonho.omniget",
+  "build": {
+    "beforeDevCommand": "node browser-extension/sync.mjs && node scripts/mcp/build-worker.mjs --debug && pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "node browser-extension/sync.mjs && node scripts/mcp/build-worker.mjs && pnpm build",
+    "frontendDist": "../build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "OmniGet",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 800,
+        "minHeight": 550,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "backgroundColor": "#1C1C1E"
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPDATA/canvas/**"
+        ]
+      }
+    },
+    "macOSPrivateApi": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVBMUREMkJDOERBOEJCOEEKUldTS3U2aU52TklkV2s5UW9LcXNyVEt3MnhLSVpwaWRjVnF0aU1yd29WeVdFSVlOMm5jRGxGMVkK",
+      "endpoints": [
+        "https://getomniget.com/update/latest.json"
+      ]
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "omniget"
+        ]
+      }
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "publisher": "OmniGet",
+    "copyright": "Copyright (C) OmniGet contributors. GPL-3.0",
+    "category": "Utility",
+    "shortDescription": "Download videos and courses and run coding agents on a canvas",
+    "homepage": "https://getomniget.com",
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "../browser-extension/chrome/": "browser-extension/chrome/",
+      "../browser-extension/firefox/": "browser-extension/firefox/"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "entitlements": "Entitlements.plist",
+      "minimumSystemVersion": "10.15"
+    },
+    "linux": {
+      "deb": {
+        "desktopTemplate": "./desktop.template",
+        "files": {
+          "/usr/share/polkit-1/actions/wtf.tonho.omniget.washmybelly.policy": "linux/wtf.tonho.omniget.washmybelly.policy"
+        }
+      },
+      "rpm": {
+        "desktopTemplate": "./desktop.template",
+        "files": {
+          "/usr/share/polkit-1/actions/wtf.tonho.omniget.washmybelly.policy": "linux/wtf.tonho.omniget.washmybelly.policy"
+        }
+      }
+    },
+    "externalBin": [
+      "binaries/omniget-worker",
+      "binaries/omniget-elevate",
+      "binaries/omniget-hook"
+    ]
+  }
+}

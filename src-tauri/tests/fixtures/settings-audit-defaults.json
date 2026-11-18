@@ -1,0 +1,323 @@
+{
+  "accessibility": {
+    "reduce_motion": false,
+    "reduce_transparency": false
+  },
+  "advanced": {
+    "concurrent_fragments": 8,
+    "cookies_from_browser": "",
+    "insecure_tls": false,
+    "max_concurrent_downloads": 2,
+    "max_concurrent_segments": 30,
+    "max_retries": 2,
+    "prevent_sleep": true,
+    "stagger_delay_ms": 150,
+    "torrent_auto_trackers": true,
+    "torrent_listen_port": 6882,
+    "torrent_stop_seeding": false,
+    "torrent_upnp": true,
+    "twitter_manual_cookie": "",
+    "user_agent": ""
+  },
+  "appearance": {
+    "language": "en",
+    "sidebar_collapsed": false,
+    "downloads_only": false,
+    "theme": "system"
+  },
+  "bridge": {
+    "canvas_port": 0,
+    "enabled": true,
+    "legacy_agent_routes": true,
+    "port": 0,
+    "token": ""
+  },
+  "canvas": {
+    "agent_presets": {},
+    "always_copy_files": false,
+    "background": "grid",
+    "cord_style": "bezier",
+    "default_agent": "shell",
+    "defaults": {
+      "agent_placement": "free",
+      "portal_placement": "free",
+      "note": {
+        "font": "",
+        "render": "formatted",
+        "size": ""
+      },
+      "portal": {
+        "size": ""
+      },
+      "terminal": {
+        "size": ""
+      },
+      "text": {
+        "size": ""
+      }
+    },
+    "focus_on_hover": false,
+    "images": {
+      "any_zoom": true,
+      "download_web": true,
+      "quality": "balanced"
+    },
+    "node_material": "opaque",
+    "notifications": {
+      "attention": true,
+      "badges_for_non_lead": false
+    },
+    "performance": {
+      "force_canvas2d": false,
+      "live_portals": 4,
+      "mounted_terminals": 12,
+      "rendering": "faithful"
+    },
+    "power": {
+      "prevent_sleep": "while_working"
+    },
+    "right_drag_pan": false,
+    "rope_routing": "behind_nodes",
+    "selection_style": "dashed",
+    "shortcuts": {},
+    "skills": {
+      "roots": {
+        "claude": "",
+        "codex": "",
+        "gemini": "",
+        "opencode": ""
+      }
+    },
+    "spell_check": false,
+    "terminal": {
+      "font_family": "",
+      "font_size": 0.0,
+      "memory_limit_mb": 0,
+      "option_as_meta": false,
+      "padding": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "shell_fallback": true,
+      "theme": "system"
+    },
+    "zoom_modifier": "alt",
+    "zoom_step": 0.1
+  },
+  "download": {
+    "always_ask_path": false,
+    "always_use_managed_cookies": false,
+    "auto_download_on_paste": false,
+    "bilibili_cdn_hosts": "",
+    "bilibili_cdn_prefer_alternatives": false,
+    "bilibili_container": "mp4",
+    "bilibili_cover_format": "jpg",
+    "bilibili_cover_sidecar": false,
+    "bilibili_danmaku_enabled": false,
+    "bilibili_danmaku_format": "xml",
+    "bilibili_naming_bangumi": "{series_title}/Season {season_number}/{episode_number_pad2} - {episode_title}",
+    "bilibili_naming_cheese": "{series_title}/{section_title}/{episode_number_pad2} - {episode_title}",
+    "bilibili_naming_collection": "{collection_title}/{title}",
+    "bilibili_naming_multi_part": "{parent_title}/P{page} - {leaf_title}",
+    "bilibili_naming_video": "{title}",
+    "bilibili_nfo_enabled": false,
+    "bilibili_preferred_audio_qn": 30300,
+    "bilibili_preferred_codec": 20,
+    "bilibili_preferred_qn": 200,
+    "caption_locale": "en",
+    "clipboard_detection": false,
+    "cookie_file": "",
+    "copy_to_clipboard_on_hotkey": true,
+    "default_output_dir": "/tmp/omniget-settings-rebrand-fixture/downloads",
+    "download_subtitles": false,
+    "embed_metadata": true,
+    "embed_thumbnail": true,
+    "filename_template": "%(title).200s [%(id)s].%(ext)s",
+    "hotkey_binding": "CmdOrCtrl+Shift+D",
+    "hotkey_enabled": false,
+    "include_auto_subtitles": false,
+    "keep_vtt": false,
+    "live_from_start": false,
+    "music_audio_format": "m4a",
+    "music_hotkey_binding": "CmdOrCtrl+Shift+M",
+    "music_hotkey_enabled": false,
+    "organize_by_platform": false,
+    "playlist_number_files": false,
+    "saved_output_dirs": [],
+    "skip_existing": true,
+    "speed_limit": "",
+    "split_by_chapters": false,
+    "sponsorblock_categories": [
+      "sponsor",
+      "selfpromo",
+      "interaction"
+    ],
+    "sponsorblock_mode": "remove",
+    "translate_metadata": false,
+    "video_compatibility": "best",
+    "video_quality": "720p",
+    "write_nfo_sidecar": false,
+    "youtube_sponsorblock": false
+  },
+  "exit_on_close": false,
+  "last_download_options": {
+    "mode": null,
+    "quality": null
+  },
+  "league": {
+    "auto_accept": false,
+    "auto_accept_delay": 0,
+    "auto_accept_swaps": false,
+    "auto_ban": false,
+    "auto_ban_delay": 0,
+    "auto_honor": false,
+    "auto_lock": true,
+    "auto_lock_at_timeout": true,
+    "auto_message": "",
+    "auto_pick": true,
+    "auto_play_again": true,
+    "auto_reconnect": false,
+    "auto_requeue": true,
+    "auto_runes": true,
+    "auto_trade": "",
+    "ban_champions": [],
+    "coach_style": "objective",
+    "enabled": true,
+    "notify_ready_check": false,
+    "pick_champions": [],
+    "pick_random": false,
+    "sgp_enabled": true,
+    "skin_roulette": false,
+    "skin_roulette_include_base": false,
+    "ward_roulette": true
+  },
+  "legal_acknowledged": true,
+  "llm": {
+    "approval_notify_delay_s": 5,
+    "ask_timeout_chat_s": 1700,
+    "ask_timeout_job_s": null,
+    "audit_retention_days": 80,
+    "auto_resume": false,
+    "job_default_deadline_min": 50,
+    "jobs_max_parallel": 4,
+    "jobs_max_per_agent": null,
+    "turn_idle_timeout_s": 600,
+    "turn_start_timeout_s": 90,
+    "turn_tool_idle_timeout_s": 1800
+  },
+  "music": {
+    "enabled": true
+  },
+  "onboarding_completed": true,
+  "portable_mode": false,
+  "proxy": {
+    "enabled": false,
+    "host": "",
+    "password": "",
+    "port": 8080,
+    "proxy_type": "http",
+    "username": ""
+  },
+  "read": {
+    "enabled": true
+  },
+  "rpc": {
+    "app_id": "1502867748353478656",
+    "enabled": true,
+    "large_image_key": "omniget_music"
+  },
+  "run_in_background": false,
+  "schema_version": 3,
+  "start_minimized": true,
+  "start_with_system": false,
+  "telegram": {
+    "concurrent_downloads": 3,
+    "enabled": true,
+    "fix_file_extensions": false,
+    "prefs": {}
+  },
+  "tube": {
+    "audio_quality": "high",
+    "autoplay_next": true,
+    "autoplay_on_open": true,
+    "blocked_channels": [],
+    "blocked_words": [],
+    "dearrow": false,
+    "dearrow_thumbs": false,
+    "default_quality": "auto",
+    "download_folder": null,
+    "enabled": true,
+    "endless_radio": true,
+    "grid_columns": 0,
+    "hide_chips": false,
+    "hide_comments": false,
+    "hide_home_feed": false,
+    "hide_live": false,
+    "hide_members": true,
+    "hide_metrics": false,
+    "hide_mixes": true,
+    "hide_playables": true,
+    "hide_posts": false,
+    "hide_related": false,
+    "hide_shorts": true,
+    "hide_upcoming": true,
+    "hide_watched": false,
+    "infinite_scroll": true,
+    "look": "classic",
+    "lyrics_provider": "auto",
+    "max_duration_s": 0,
+    "min_duration_s": 1,
+    "normalize_volume": false,
+    "prefer_codec": "auto",
+    "preview_on_hover": true,
+    "ryd": true,
+    "sb_categories": {
+      "exclusive_access": "show",
+      "filler": "off",
+      "hook": "show",
+      "interaction": "ask",
+      "intro": "show",
+      "music_offtopic": "skip",
+      "outro": "show",
+      "poi_highlight": "show",
+      "preview": "show",
+      "selfpromo": "ask",
+      "sponsor": "skip"
+    },
+    "sb_download": "off",
+    "sb_server": "https://sponsor.ajay.app",
+    "sb_whitelist": [],
+    "send_history": true,
+    "sponsorblock": true,
+    "start_face": "video",
+    "start_page": "home",
+    "storage_cap_gb": 0.0,
+    "use_account": true,
+    "watched_threshold": 84,
+    "whole_word": true
+  },
+  "typography": {
+    "font_body": "Inter",
+    "font_display": "Bricolage Grotesque Variable",
+    "font_mono": "IBM Plex Mono",
+    "line_height_base": 1.5499999523162842,
+    "preset_name": "omniget-default",
+    "spacing_scale": 1.0
+  },
+  "video": {
+    "enabled": true
+  },
+  "washmybelly": {
+    "auto_hold_power": false,
+    "enabled": true,
+    "perf_tool_path": "",
+    "protected_paths_extra": [],
+    "quarantine_days": 7
+  },
+  "world": {
+    "enabled": true
+  },
+  "superpowers": {
+    "pinned": []
+  }
+}

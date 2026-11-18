@@ -1,0 +1,65 @@
+# Dependencies
+node_modules/
+
+# SvelteKit / Vite
+/build/
+/.svelte-kit/
+/package/
+.vite/
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+*.tsbuildinfo
+.eslintcache
+
+# Rust / Cargo / Tauri
+/src-tauri/target/
+/src-tauri/gen/schemas
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# pdf.js runtime for the /read reader, copied from node_modules by scripts/setup-pdfjs.mjs
+/static/vendor/pdfjs/
+
+# Local release output (scripts/release-local.mjs)
+/dist-release/
+
+# Copied from chrome/ by `pnpm extension:sync`; only the Firefox manifest is versioned
+/browser-extension/firefox/*
+!/browser-extension/firefox/manifest.json
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs, local databases, leftovers
+*.log
+*.sqlite
+*.sqlite-journal
+*.db
+*.bak
+*.tmp
+*.tgz
+/coverage/
+*.lcov
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Private CI scripts (server alias, secrets path). Never tracked.
+/scripts/ci/
+
+# Files exchanged with SignPath during a Windows release (scripts/release-local.mjs --stage)
+/signpath/

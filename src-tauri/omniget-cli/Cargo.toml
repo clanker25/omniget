@@ -1,0 +1,37 @@
+[package]
+name = "omniget-cli"
+default-run = "omniget-cli"
+version = "1.0.1"
+edition = "2021"
+description = "OmniGet command line: download from YouTube, Instagram, X and the sites yt-dlp supports, and run AI agent jobs and loops"
+
+[package.metadata.cargo-machete]
+ignored = ["sysinfo", "tauri-winres"]
+
+[build-dependencies]
+tauri-winres = "0.3"
+
+[[bin]]
+name = "omniget-hook-shim"
+path = "src/bin/omniget-hook-shim.rs"
+
+[dependencies]
+omniget-core = { path = "../omniget-core" }
+sysinfo = "0.39.6"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+chrono = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+hex = "0.4"
+
+futures = "0.3"
+oauth2 = "=5.0.0"
+axum = "0.8"

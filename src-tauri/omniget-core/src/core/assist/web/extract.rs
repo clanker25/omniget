@@ -1,0 +1,235 @@
+use once_cell::sync::Lazy;
+use regex::Regex;
+use unicode_normalization::UnicodeNormalization;
+
+pub const OPEN_MARK: &str = "<<<CONTEUDO_WEB_NAO_CONFIAVEL>>>";
+pub const CLOSE_MARK: &str = "<<<FIM_CONTEUDO_WEB>>>";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Extracted {
+    pub title: Option<String>,
+    pub lang: Option<String>,
+    pub description: Option<String>,
+    pub text: String,
+    pub json_ld: Vec<String>,
+}
+
+macro_rules! re {
+    ($name:ident, $pat:expr) => {
+        static $name: Lazy<Regex> = Lazy::new(|| Regex::new($pat).expect("static regex"));
+    };
+}
+
+re!(RE_COMMENT, r"(?s)<!--.*?-->");
+re!(
+    RE_JSONLD,
+    r#"(?is)<script[^>]*type\s*=\s*["']?application/ld\+json["']?[^>]*>(.*?)</script>"#
+);
+re!(RE_SCRIPT, r"(?is)<script\b.*?</script\s*>");
+re!(RE_STYLE, r"(?is)<style\b.*?</style\s*>");
+re!(RE_NOSCRIPT, r"(?is)<noscript\b.*?</noscript\s*>");
+re!(RE_SVG, r"(?is)<svg\b.*?</svg\s*>");
+re!(RE_TEMPLATE, r"(?is)<template\b.*?</template\s*>");
+re!(RE_HEAD, r"(?is)<head\b.*?</head\s*>");
+re!(RE_TITLE, r"(?is)<title[^>]*>(.*?)</title>");
+re!(
+    RE_LANG,
+    r#"(?i)<html[^>]*\blang\s*=\s*["']?([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?)"#
+);
+re!(
+    RE_META_DESC,
+    r#"(?is)<meta[^>]+(?:name|property)\s*=\s*["'](?:description|og:description)["'][^>]*content\s*=\s*["']([^"']*)["']"#
+);
+re!(RE_BREAK, r"(?i)<br\s*/?>");
+re!(
+    RE_BLOCK_END,
+    r"(?i)</(?:p|div|li|h[1-6]|tr|td|th|section|article|header|footer|ul|ol|table|blockquote|dd|dt|main|nav|aside|figure|figcaption|label|button)\s*>"
+);
+re!(RE_BLOCK_START, r"(?i)<(?:li|h[1-6]|tr)\b[^>]*>");
+re!(RE_TAG, r"(?s)<[^>]*>");
+re!(
+    RE_ENTITY,
+    r"&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});"
+);
+re!(RE_SPACES, r"[ \t\u{00A0}\u{200B}]+");
+
+static INJECTION_PATTERNS: Lazy<Vec<(&'static str, Regex)>> = Lazy::new(|| {
+    [
+        ("ignore_instructions", r"(?i)\b(ignore|disregard|forget)\b.{0,40}\b(instructions?|rules|prompt|guidelines)\b"),
+        ("ignore_instructions_pt", r"(?i)\b(ignore|ignorar|desconsidere|esque[çc]a)\b.{0,40}\b(instru[çc][õo]es|regras|prompt)\b"),
+        ("new_instructions", r"(?i)\b(new|novas?)\s+(instructions?|instru[çc][õo]es)\b"),
+        ("system_prompt", r"(?i)\b(system prompt|mensagem de sistema|developer mode|modo desenvolvedor)\b"),
+        ("role_override", r"(?i)\b(you are now|a partir de agora voc[êe] [ée]|act as an? (admin|root|system))\b"),
+        ("grant_request", r"(?i)\b(grant|conceda|give yourself|d[êe] a si)\b.{0,40}\b(access|acesso|permission|permiss[ãa]o|tool|ferramenta|scope|escopo)\b"),
+        ("tool_names", r"(?i)\b(shell_exec|fs_write|fs_delete|memory_forget|todo_write)\b"),
+        ("destructive_shell", r"(?i)(rm\s+-rf|curl\s+[^\s]+\s*\|\s*(sh|bash)|chmod\s+777)"),
+        ("exfiltrate", r"(?i)\b(send|envie|upload|post)\b.{0,40}\b(token|password|senha|api key|chave|cookie)s?\b"),
+    ]
+    .into_iter()
+    .map(|(k, p)| (k, Regex::new(p).expect("static regex")))
+    .collect()
+});
+
+fn named_entity(name: &str) -> Option<char> {
+    Some(match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => ' ',
+        "ndash" => '–',
+        "mdash" => '—',
+        "hellip" => '…',
+        "laquo" => '«',
+        "raquo" => '»',
+        "ldquo" => '“',
+        "rdquo" => '”',
+        "lsquo" => '‘',
+        "rsquo" => '’',
+        "middot" => '·',
+        "bull" => '•',
+        "copy" => '©',
+        "reg" => '®',
+        "trade" => '™',
+        "deg" => '°',
+        "ordf" => 'ª',
+        "ordm" => 'º',
+        "iexcl" => '¡',
+        "iquest" => '¿',
+        "szlig" => 'ß',
+        _ => return accented(name),
+    })
+}
+
+fn accented(name: &str) -> Option<char> {
+    let (base, mark) = name.split_at(1);
+    let base = base.chars().next()?;
+    let combining = match mark {
+        "acute" => '\u{0301}',
+        "grave" => '\u{0300}',
+        "circ" => '\u{0302}',
+        "tilde" => '\u{0303}',
+        "uml" => '\u{0308}',
+        "cedil" => '\u{0327}',
+        "ring" => '\u{030A}',
+        _ => return None,
+    };
+    let composed: String = [base, combining].iter().collect::<String>().nfc().collect();
+    let mut it = composed.chars();
+    let c = it.next()?;
+    it.next().is_none().then_some(c)
+}
+
+pub fn decode_entities(s: &str) -> String {
+    RE_ENTITY
+        .replace_all(s, |caps: &regex::Captures| {
+            let body = &caps[1];
+            let c = if let Some(hex) = body.strip_prefix("#x").or_else(|| body.strip_prefix("#X")) {
+                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+            } else if let Some(dec) = body.strip_prefix('#') {
+                dec.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                named_entity(body)
+            };
+            c.map(|c| c.to_string())
+                .unwrap_or_else(|| caps[0].to_string())
+        })
+        .into_owned()
+}
+
+fn clean_inline(s: &str) -> String {
+    let no_tags = RE_TAG.replace_all(s, " ");
+    let decoded = decode_entities(&no_tags);
+    RE_SPACES
+        .replace_all(decoded.trim(), " ")
+        .trim()
+        .to_string()
+}
+
+pub fn extract_html(html: &str) -> Extracted {
+    let html = RE_COMMENT.replace_all(html, " ");
+    let title = RE_TITLE
+        .captures(&html)
+        .map(|c| clean_inline(&c[1]))
+        .filter(|s| !s.is_empty());
+    let lang = RE_LANG.captures(&html).map(|c| c[1].to_string());
+    let description = RE_META_DESC
+        .captures(&html)
+        .map(|c| clean_inline(&c[1]))
+        .filter(|s| !s.is_empty());
+    let json_ld = RE_JSONLD
+        .captures_iter(&html)
+        .map(|c| truncate_chars(c[1].trim(), 4_000))
+        .filter(|s| !s.is_empty())
+        .take(4)
+        .collect();
+    let mut body = html.into_owned();
+    for re in [
+        &*RE_SCRIPT,
+        &*RE_STYLE,
+        &*RE_NOSCRIPT,
+        &*RE_SVG,
+        &*RE_TEMPLATE,
+        &*RE_HEAD,
+    ] {
+        body = re.replace_all(&body, " ").into_owned();
+    }
+    body = RE_BREAK.replace_all(&body, "\n").into_owned();
+    body = RE_BLOCK_START.replace_all(&body, "\n").into_owned();
+    body = RE_BLOCK_END.replace_all(&body, "\n").into_owned();
+    body = RE_TAG.replace_all(&body, " ").into_owned();
+    let text = normalise_text(&decode_entities(&body));
+    Extracted {
+        title,
+        lang,
+        description,
+        text,
+        json_ld,
+    }
+}
+
+pub fn normalise_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() / 2);
+    let mut blank = false;
+    for line in s.lines() {
+        let line = RE_SPACES.replace_all(line.trim(), " ");
+        let line = line.trim();
+        if line.is_empty() {
+            if !blank && !out.is_empty() {
+                out.push('\n');
+            }
+            blank = true;
+            continue;
+        }
+        blank = false;
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => s[..i].to_string(),
+        None => s.to_string(),
+    }
+}
+
+pub fn suspicious(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (kind, re) in INJECTION_PATTERNS.iter() {
+        if let Some(m) = re.find(text) {
+            out.push((kind.to_string(), truncate_chars(m.as_str(), 120)));
+        }
+    }
+    out
+}
+
+pub fn neutralise(s: &str) -> String {
+    s.replace("<<<", "‹‹‹").replace(">>>", "›››")
+}
+
+pub fn wrap_untrusted(text: &str) -> String {
+    format!("{OPEN_MARK}\n{}\n{CLOSE_MARK}", neutralise(text))
+}

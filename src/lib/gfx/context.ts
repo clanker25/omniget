@@ -1,0 +1,95 @@
+type ContextState = 'new' | 'live' | 'sleeping' | 'lost' | 'restoring' | 'destroyed';
+
+type ContextEvent = 'init' | 'sleep' | 'wake' | 'lost' | 'restored' | 'destroy';
+
+function nextState(state: ContextState, event: ContextEvent): ContextState {
+  if (event === 'destroy') return 'destroyed';
+  if (state === 'destroyed') return 'destroyed';
+  switch (event) {
+    case 'init':
+      return 'live';
+    case 'sleep':
+      return state === 'live' || state === 'lost' || state === 'restoring' ? 'sleeping' : state;
+    case 'wake':
+      return state === 'sleeping' || state === 'lost' ? 'restoring' : state;
+    case 'lost':
+      return state === 'sleeping' ? 'sleeping' : 'lost';
+    case 'restored':
+      return state === 'sleeping' ? 'sleeping' : 'live';
+    default:
+      return state;
+  }
+}
+
+interface ContextCallbacks {
+  onLost?: () => void;
+  onRestored?: () => void;
+}
+
+export class ContextTracker {
+  state: ContextState = 'new';
+  private intentional = false;
+  private canvas: HTMLCanvasElement | null = null;
+  private cbs: ContextCallbacks = {};
+  private readonly lostHandler = (e: Event) => {
+    e.preventDefault();
+    this.state = nextState(this.state, 'lost');
+    if (!this.intentional) this.cbs.onLost?.();
+  };
+  private readonly restoredHandler = () => {
+    this.state = nextState(this.state, 'restored');
+    if (!this.intentional) this.cbs.onRestored?.();
+  };
+
+  attach(canvas: HTMLCanvasElement, cbs: ContextCallbacks = {}): void {
+    this.detach();
+    this.canvas = canvas;
+    this.cbs = cbs;
+    canvas.addEventListener('webglcontextlost', this.lostHandler as EventListener, false);
+    canvas.addEventListener('webglcontextrestored', this.restoredHandler as EventListener, false);
+    this.state = nextState(this.state, 'init');
+  }
+
+  detach(): void {
+    if (!this.canvas) return;
+    this.canvas.removeEventListener('webglcontextlost', this.lostHandler as EventListener);
+    this.canvas.removeEventListener('webglcontextrestored', this.restoredHandler as EventListener);
+    this.canvas = null;
+  }
+
+  apply(event: ContextEvent): ContextState {
+    this.state = nextState(this.state, event);
+    return this.state;
+  }
+
+  loseDeliberately(gl: WebGLRenderingContext | WebGL2RenderingContext | null): void {
+    this.intentional = true;
+    this.state = nextState(this.state, 'sleep');
+    const ext = gl?.getExtension('WEBGL_lose_context') as
+      | { loseContext(): void; restoreContext(): void }
+      | null
+      | undefined;
+    try {
+      ext?.loseContext();
+    } catch {
+    }
+  }
+
+  restoreDeliberately(gl: WebGLRenderingContext | WebGL2RenderingContext | null): void {
+    this.state = nextState(this.state, 'wake');
+    const ext = gl?.getExtension('WEBGL_lose_context') as
+      | { loseContext(): void; restoreContext(): void }
+      | null
+      | undefined;
+    try {
+      ext?.restoreContext();
+    } catch {
+    }
+    this.intentional = false;
+    this.state = nextState(this.state, 'restored');
+  }
+
+  get isLive(): boolean {
+    return this.state === 'live';
+  }
+}

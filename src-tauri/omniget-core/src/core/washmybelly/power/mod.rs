@@ -1,0 +1,786 @@
+pub mod arbiter;
+pub mod hold;
+pub mod parse;
+pub mod sysfs;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod windows;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+
+use super::elevate::ElevatedOp;
+use super::plan::{Op, Outcome, PlanItem};
+use super::receipt::Undo;
+use super::store::Ctx;
+use super::Risk;
+
+pub use hold::{auto_hold_begin, set_auto_hold, HoldState, HoldToken};
+
+const MODULE: &str = "power";
+pub const PLAN_KIND: &str = "power";
+
+pub const ACTIONS: &[&str] = &[
+    "set_scheme",
+    "ultimate",
+    "lowpowermode",
+    "cpu_epp",
+    "cpu_governor",
+    "charge_limit",
+    "resolve_conflict",
+];
+
+pub const SETTING_KEYS: &[&str] = &[
+    "cpu_epp",
+    "cpu_governor",
+    "charge_limit",
+    "lowpowermode",
+    "manager_off",
+    "manager_on",
+];
+
+pub const PROFILES: &[&str] = &["power-saver", "balanced", "performance"];
+
+pub async fn tool_battery_health(a: Value) -> Result<Value, String> {
+    super::monitor::tool_battery_health(a).await
+}
+
+fn backend() -> Box<dyn hold::Backend> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(linux::DbusBackend)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(macos::CaffeinateBackend)
+    }
+    #[cfg(windows)]
+    {
+        Box::new(windows::PowerRequestBackend)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        struct None_;
+        impl hold::Backend for None_ {
+            fn name(&self) -> &'static str {
+                "none"
+            }
+            fn acquire(&self, _: &str, _: Option<u64>) -> Result<Box<dyn Send>, String> {
+                Err("power hold: unsupported system".into())
+            }
+        }
+        Box::new(None_)
+    }
+}
+
+pub async fn tool_hold(a: Value) -> Result<Value, String> {
+    let action = crate::core::llm::tool_table::need_str(&a, "action")?;
+    let minutes = a
+        .get("max_minutes")
+        .and_then(Value::as_u64)
+        .unwrap_or(60)
+        .min(u64::from(hold::MAX_MINUTES)) as u32;
+    let who = match a.get("_source").and_then(Value::as_str) {
+        Some("ui") => "held from the OmniGet screen",
+        Some("external") => "held by an external MCP client",
+        _ => "held by an OmniGet agent",
+    };
+    let reason: String = a
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(|r| r.chars().filter(|c| !c.is_control()).take(120).collect())
+        .filter(|r: &String| !r.trim().is_empty())
+        .unwrap_or_else(|| who.to_string());
+    super::tools::blocking(move || {
+        let h = hold::global();
+        let st = match action.as_str() {
+            "hold" => {
+                let st = h.hold(minutes, &reason)?;
+                if let Some(until) = st.until {
+                    hold::arm_timer(until);
+                }
+                st
+            }
+            "release" => h.release(),
+            other => return Err(format!("unknown action {other}; use hold or release")),
+        };
+        hold::persist(&st);
+        serde_json::to_value(&st).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+fn item(
+    id: String,
+    label: String,
+    detail: Option<String>,
+    admin: bool,
+    action: &str,
+    args: Value,
+) -> PlanItem {
+    PlanItem {
+        id,
+        label,
+        detail,
+        group: "power".into(),
+        bytes: 0,
+        risk: Risk::Reversible,
+        admin,
+        op: Op::Module {
+            module: MODULE.into(),
+            action: action.into(),
+            args,
+        },
+    }
+}
+
+fn action_view(it: &PlanItem) -> Value {
+    let (action, args) = match &it.op {
+        Op::Module { action, args, .. } => (action.clone(), args.clone()),
+        _ => (String::new(), Value::Null),
+    };
+    json!({ "id": it.id, "label": it.label, "detail": it.detail, "admin": it.admin, "risk": it.risk, "action": action, "args": args })
+}
+
+pub async fn tool_status(_a: Value) -> Result<Value, String> {
+    super::tools::blocking(move || {
+        let (mut v, items) = read_status();
+        super::plan::register(PLAN_KIND, &items);
+        v["actions"] = Value::Array(items.iter().map(action_view).collect());
+        v["plan_kind"] = json!(PLAN_KIND);
+        v["hold"] = serde_json::to_value(hold::global().state()).unwrap_or(Value::Null);
+        Ok(v)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+fn read_status() -> (Value, Vec<PlanItem>) {
+    let sys = std::path::Path::new("/sys");
+    let mut reasons = Map::new();
+    let mut running = linux::running_managers();
+    let profiles = match linux::profiles() {
+        Ok(p) => p,
+        Err(e) => {
+            reasons.insert("profiles".into(), json!(e));
+            None
+        }
+    };
+    if let Some(m) = profiles
+        .as_ref()
+        .and_then(|p| p["daemon"].as_str())
+        .and_then(|d| arbiter::Manager::ALL.into_iter().find(|m| m.id() == d))
+    {
+        if !running.contains(&m) {
+            running.push(m);
+        }
+    }
+    let verdict = arbiter::arbitrate(&running);
+    let knobs = parse::cpu_knobs(sys);
+    let limits = parse::charge_limits(sys);
+    let tlp = running
+        .contains(&arbiter::Manager::Tlp)
+        .then(linux::tlp_stat)
+        .flatten();
+    let blockers = linux::sleep_blockers().unwrap_or_else(|e| {
+        reasons.insert("sleep_blockers".into(), json!(e));
+        Vec::new()
+    });
+    let items = linux_items(&running, &verdict, &knobs, &limits);
+    let v = json!({
+        "os": "linux",
+        "profile": profiles.as_ref().map(|p| json!({
+            "current": p["active"],
+            "available": p["profiles"],
+            "holds": p["holds"],
+            "degraded": p["degraded"],
+            "can_switch": true,
+        })),
+        "manager": verdict.manager,
+        "managers_running": running.iter().map(|m| m.id()).collect::<Vec<_>>(),
+        "conflicts": verdict.conflicts,
+        "suggestion": verdict.suggestion,
+        "tlp": tlp,
+        "cpu": knobs,
+        "charge_limits": limits,
+        "sleep_blockers": blockers,
+        "sleep_blockers_need_admin": false,
+        "reasons": reasons,
+    });
+    (v, items)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_items(
+    running: &[arbiter::Manager],
+    verdict: &arbiter::Verdict,
+    knobs: &parse::CpuKnobs,
+    limits: &[parse::ChargeLimit],
+) -> Vec<PlanItem> {
+    let mut items = Vec::new();
+    if let Some(c) = verdict.conflicts.first() {
+        let keep = c.keep;
+        let units = arbiter::units_to_disable(running, keep);
+        items.push(item(
+            format!("power:resolve_conflict:{keep}"),
+            format!("Keep {keep}, turn off {}", units.join(", ")),
+            Some(
+                "Stops, disables and masks the other power managers. Undo turns them back on."
+                    .into(),
+            ),
+            true,
+            "resolve_conflict",
+            json!({ "keep": keep, "units": units }),
+        ));
+    }
+    if verdict.manager.is_none() && verdict.conflicts.is_empty() {
+        for e in &knobs.epps {
+            if Some(e) != knobs.epp.as_ref() && e != "default" {
+                items.push(item(
+                    format!("power:cpu_epp:{e}"),
+                    format!("CPU energy preference: {e}"),
+                    Some("Applies now, until the next restart.".into()),
+                    true,
+                    "cpu_epp",
+                    json!({ "value": e }),
+                ));
+            }
+        }
+        for g in &knobs.governors {
+            if Some(g) != knobs.governor.as_ref() {
+                items.push(item(
+                    format!("power:cpu_governor:{g}"),
+                    format!("CPU governor: {g}"),
+                    Some("Applies now, until the next restart.".into()),
+                    true,
+                    "cpu_governor",
+                    json!({ "value": g }),
+                ));
+            }
+        }
+    }
+    let limit_owner = running
+        .iter()
+        .any(|m| matches!(m, arbiter::Manager::Tlp | arbiter::Manager::AutoCpufreq));
+    if !limit_owner {
+        for l in limits {
+            for pct in [60u8, 80, 100] {
+                if pct != l.end {
+                    items.push(item(
+                        format!("power:charge_limit:{}:{pct}", l.battery),
+                        if pct == 100 {
+                            format!("Charge {} fully", l.battery)
+                        } else {
+                            format!("Stop charging {} at {pct}%", l.battery)
+                        },
+                        Some(
+                            "A lower limit slows battery wear on a laptop that stays plugged in."
+                                .into(),
+                        ),
+                        true,
+                        "charge_limit",
+                        json!({ "battery": l.battery, "percent": pct }),
+                    ));
+                }
+            }
+        }
+    }
+    items
+}
+
+#[cfg(target_os = "macos")]
+fn read_status() -> (Value, Vec<PlanItem>) {
+    let mut reasons = Map::new();
+    let s = macos::settings().unwrap_or_else(|e| {
+        reasons.insert("pmset".into(), json!(e));
+        parse::PmsetSettings::default()
+    });
+    let blockers = macos::assertions().unwrap_or_else(|e| {
+        reasons.insert("sleep_blockers".into(), json!(e));
+        Vec::new()
+    });
+    let items = mac_items(&s);
+    let v = json!({
+        "os": "macos",
+        "profile": {
+            "current": match s.low_power_mode { Some(true) => "low-power", Some(false) => "automatic", None => "unknown" },
+            "available": ["automatic", "low-power"],
+            "can_switch": false,
+        },
+        "manager": "pmset",
+        "managers_running": [],
+        "conflicts": [],
+        "low_power_mode": s.low_power_mode,
+        "power_mode": s.power_mode,
+        "sleep_minutes": s.sleep_minutes,
+        "display_sleep_minutes": s.display_sleep_minutes,
+        "sleep_prevented_by": s.sleep_prevented_by,
+        "sleep_blockers": blockers,
+        "sleep_blockers_need_admin": false,
+        "reasons": reasons,
+    });
+    (v, items)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mac_items(s: &parse::PmsetSettings) -> Vec<PlanItem> {
+    let Some(on) = s.low_power_mode else {
+        return Vec::new();
+    };
+    let next = !on;
+    vec![item(
+        format!("power:lowpowermode:{}", if next { "on" } else { "off" }),
+        if next {
+            "Turn on Low Power Mode".into()
+        } else {
+            "Turn off Low Power Mode".into()
+        },
+        Some("Changes pmset for battery and power adapter. Needs your password.".into()),
+        true,
+        "lowpowermode",
+        json!({ "on": next }),
+    )]
+}
+
+#[cfg(windows)]
+fn read_status() -> (Value, Vec<PlanItem>) {
+    let mut reasons = Map::new();
+    let list = windows::schemes().unwrap_or_else(|e| {
+        reasons.insert("plans".into(), json!(e));
+        Vec::new()
+    });
+    let active = windows::active_scheme()
+        .ok()
+        .flatten()
+        .or_else(|| list.iter().find(|s| s.active).cloned());
+    let (ac, dc) = windows::overlay();
+    let (blockers, need_admin) = match windows::requests() {
+        Ok(b) => (b, false),
+        Err(_) => (Vec::new(), true),
+    };
+    let created: Option<String> = Ctx::app()
+        .ok()
+        .and_then(|c| c.kv_get("power_ultimate_guid"));
+    let items = win_items(&list, created.as_deref());
+    let v = json!({
+        "os": "windows",
+        "profile": {
+            "current": ac.or(dc),
+            "overlay": { "ac": ac, "dc": dc },
+            "available": ["best_efficiency", "balanced", "best_performance"],
+            "can_switch": false,
+        },
+        "manager": "windows",
+        "managers_running": [],
+        "conflicts": [],
+        "active_plan": active,
+        "plans": list,
+        "ultimate": { "present": ultimate_present(&list, created.as_deref()) },
+        "sleep_blockers": blockers,
+        "sleep_blockers_need_admin": need_admin,
+        "reasons": reasons,
+    });
+    (v, items)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ultimate_present(list: &[parse::Scheme], created: Option<&str>) -> bool {
+    list.iter().any(|s| {
+        s.guid == parse::ULTIMATE_TEMPLATE
+            || Some(s.guid.as_str()) == created
+            || s.name.to_ascii_lowercase().contains("ultimate")
+    })
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn win_items(list: &[parse::Scheme], created: Option<&str>) -> Vec<PlanItem> {
+    let mut items: Vec<PlanItem> = list
+        .iter()
+        .filter(|s| !s.active)
+        .map(|s| {
+            item(
+                format!("power:set_scheme:{}", s.guid),
+                format!("Switch to the {} plan", s.name),
+                None,
+                false,
+                "set_scheme",
+                json!({ "guid": s.guid, "name": s.name }),
+            )
+        })
+        .collect();
+    if !ultimate_present(list, created) {
+        items.push(item(
+            "power:ultimate".into(),
+            "Add the Ultimate Performance plan and switch to it".into(),
+            Some(
+                "Windows hides this plan on most editions. Undo switches back and removes it."
+                    .into(),
+            ),
+            false,
+            "ultimate",
+            json!({}),
+        ));
+    }
+    items
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn read_status() -> (Value, Vec<PlanItem>) {
+    (
+        json!({ "os": "unknown", "reasons": { "power": "unsupported system" } }),
+        Vec::new(),
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Snap {
+    Scheme {
+        previous: String,
+        created: Option<String>,
+    },
+    Settings {
+        ops: Vec<(String, String)>,
+    },
+}
+
+fn check_action(action: &str) -> Result<(), String> {
+    if ACTIONS.contains(&action) {
+        Ok(())
+    } else {
+        Err(format!("power: unknown action {action}"))
+    }
+}
+
+fn undo_of(id: String) -> Option<Undo> {
+    Some(Undo::Module {
+        module: MODULE.into(),
+        action: "restore_snapshot".into(),
+        args: json!({ "snapshot": id }),
+    })
+}
+
+pub fn plan_execute(
+    ctx: &Ctx,
+    receipt_id: &str,
+    action: &str,
+    args: &Value,
+) -> Result<Outcome, String> {
+    check_action(action)?;
+    #[cfg(windows)]
+    {
+        let previous = windows::active_scheme()?
+            .ok_or("no active power plan")?
+            .guid;
+        match action {
+            "set_scheme" => {
+                let guid = args["guid"].as_str().ok_or("set_scheme: guid")?;
+                if !parse::is_guid(guid) {
+                    return Err("set_scheme: invalid GUID".into());
+                }
+                let snap = ctx.snapshot_put(
+                    receipt_id,
+                    MODULE,
+                    "scheme",
+                    &Snap::Scheme {
+                        previous,
+                        created: None,
+                    },
+                )?;
+                windows::set_active(guid)?;
+                return Ok(Outcome {
+                    detail: format!("switched to {}", args["name"].as_str().unwrap_or(guid)),
+                    bytes: 0,
+                    undo: undo_of(snap),
+                });
+            }
+            "ultimate" => {
+                let created = windows::duplicate_ultimate()?;
+                let snap = ctx.snapshot_put(
+                    receipt_id,
+                    MODULE,
+                    "scheme",
+                    &Snap::Scheme {
+                        previous,
+                        created: Some(created.clone()),
+                    },
+                )?;
+                let _ = ctx.kv_set("power_ultimate_guid", &created);
+                windows::set_active(&created)?;
+                return Ok(Outcome {
+                    detail: "Ultimate Performance added and active".into(),
+                    bytes: 0,
+                    undo: undo_of(snap),
+                });
+            }
+            _ => {}
+        }
+    }
+    let _ = (ctx, receipt_id, args);
+    Err(format!(
+        "power: {action} needs an administrator on this system"
+    ))
+}
+
+#[allow(unused_variables)]
+fn setting_changes(action: &str, args: &Value) -> Result<Vec<(String, String, String)>, String> {
+    match action {
+        #[cfg(target_os = "macos")]
+        "lowpowermode" => {
+            let on = args["on"].as_bool().ok_or("lowpowermode: on")?;
+            let cur = macos::settings()?
+                .low_power_mode
+                .ok_or("this Mac has no Low Power Mode")?;
+            Ok(vec![("lowpowermode".into(), bit(on), bit(cur))])
+        }
+        #[cfg(target_os = "linux")]
+        "cpu_epp" | "cpu_governor" => {
+            let value = args["value"].as_str().ok_or("value")?.to_string();
+            let k = parse::cpu_knobs(std::path::Path::new("/sys"));
+            let (cur, list) = if action == "cpu_epp" {
+                (k.epp, k.epps)
+            } else {
+                (k.governor, k.governors)
+            };
+            let cur = cur.ok_or("this CPU does not expose it")?;
+            if !list.contains(&value) {
+                return Err(format!("{value} is not available on this CPU"));
+            }
+            Ok(vec![(action.to_string(), value, cur)])
+        }
+        #[cfg(target_os = "linux")]
+        "charge_limit" => {
+            let bat = args["battery"].as_str().ok_or("battery")?;
+            let pct = args["percent"].as_u64().ok_or("percent")?;
+            let cur = parse::charge_limits(std::path::Path::new("/sys"))
+                .into_iter()
+                .find(|c| c.battery == bat)
+                .ok_or("that battery has no charge limit")?;
+            Ok(vec![(
+                "charge_limit".into(),
+                format!("{bat}:{pct}"),
+                format!("{bat}:{}", cur.end),
+            )])
+        }
+        #[cfg(target_os = "linux")]
+        "resolve_conflict" => {
+            let keep = args["keep"].as_str().ok_or("keep")?;
+            let running = linux::running_managers();
+            let units = arbiter::units_to_disable(&running, keep);
+            if units.is_empty() {
+                return Err("there is no conflict any more".into());
+            }
+            Ok(units
+                .into_iter()
+                .map(|u| ("manager_off".to_string(), u.to_string(), u.to_string()))
+                .collect())
+        }
+        _ => Err(format!(
+            "power: action {action} has no administrator form here"
+        )),
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn bit(b: bool) -> String {
+    if b { "1" } else { "0" }.into()
+}
+
+fn reverse(key: &str, old: &str) -> (String, String) {
+    match key {
+        "manager_off" => ("manager_on".into(), old.into()),
+        k => (k.into(), old.into()),
+    }
+}
+
+pub fn plan_elevated(
+    ctx: &Ctx,
+    receipt_id: &str,
+    action: &str,
+    args: &Value,
+) -> Result<(Vec<ElevatedOp>, Option<Undo>), String> {
+    check_action(action)?;
+    let changes = setting_changes(action, args)?;
+    for (k, v, _) in &changes {
+        validate_setting(k, v)?;
+    }
+    let back: Vec<(String, String)> = changes
+        .iter()
+        .rev()
+        .map(|(k, _, old)| reverse(k, old))
+        .collect();
+    let snap = ctx.snapshot_put(receipt_id, MODULE, action, &Snap::Settings { ops: back })?;
+    let ops = changes
+        .into_iter()
+        .map(|(key, value, _)| ElevatedOp::PowerSetting { key, value })
+        .collect();
+    Ok((ops, undo_of(snap)))
+}
+
+pub fn plan_undo(ctx: &Ctx, action: &str, args: &Value) -> Result<String, String> {
+    if action != "restore_snapshot" {
+        return Err(format!("power: cannot undo {action}"));
+    }
+    let id = args["snapshot"].as_str().ok_or("snapshot id")?;
+    match ctx.snapshot_get::<Snap>(id)? {
+        Snap::Scheme { previous, created } => restore_scheme(&previous, created.as_deref()),
+        Snap::Settings { ops } => {
+            for (k, v) in &ops {
+                validate_setting(k, v)?;
+            }
+            let batch: Vec<ElevatedOp> = ops
+                .into_iter()
+                .map(|(key, value)| ElevatedOp::PowerSetting { key, value })
+                .collect();
+            let results = super::elevate::run(ctx, &batch)?;
+            match results.iter().find(|r| !r.ok) {
+                Some(r) => Err(r.detail.clone()),
+                None => Ok("power settings restored".into()),
+            }
+        }
+    }
+}
+
+#[allow(unused_variables)]
+fn restore_scheme(previous: &str, created: Option<&str>) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        windows::set_active(previous)?;
+        if let Some(c) = created {
+            windows::delete_scheme(c)?;
+            if let Ok(ctx) = Ctx::app() {
+                let _ = ctx.kv_set("power_ultimate_guid", &Value::Null);
+            }
+        }
+        return Ok("previous power plan restored".into());
+    }
+    #[allow(unreachable_code)]
+    Err("power plans only exist on Windows".into())
+}
+
+pub fn validate_setting(key: &str, value: &str) -> Result<(), String> {
+    if !SETTING_KEYS.contains(&key) {
+        return Err(format!("power_setting: key {key:?} is not allowed"));
+    }
+    let token = |v: &str| {
+        !v.is_empty()
+            && v.len() <= 40
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    let ok = match key {
+        "cpu_epp" | "cpu_governor" => token(value),
+        "lowpowermode" => value == "0" || value == "1",
+        "charge_limit" => value.split_once(':').is_some_and(|(b, p)| {
+            parse::valid_battery_name(b) && p.parse::<u8>().is_ok_and(|p| (20..=100).contains(&p))
+        }),
+        "manager_off" | "manager_on" => arbiter::Manager::from_unit(value).is_some(),
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "power_setting: value {value:?} is not valid for {key}"
+        ))
+    }
+}
+
+pub fn elevated_setting(key: &str, value: &str) -> Result<String, String> {
+    validate_setting(key, value)?;
+    #[cfg(target_os = "linux")]
+    {
+        let sys = std::path::Path::new("/sys");
+        return match key {
+            "cpu_epp" => sysfs::write_cpu_knob(
+                sys,
+                "energy_performance_preference",
+                "energy_performance_available_preferences",
+                value,
+            ),
+            "cpu_governor" => sysfs::write_cpu_knob(
+                sys,
+                "scaling_governor",
+                "scaling_available_governors",
+                value,
+            ),
+            "charge_limit" => sysfs::write_charge_limit(sys, value),
+            "manager_off" => linux::manager_unit(value, false),
+            "manager_on" => linux::manager_unit(value, true),
+            _ => Err(format!("power_setting: {key} is not a Linux setting")),
+        };
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return match key {
+            "lowpowermode" => macos::set_low_power_mode(value == "1"),
+            _ => Err(format!("power_setting: {key} is not a macOS setting")),
+        };
+    }
+    #[allow(unreachable_code)]
+    Err(format!(
+        "power_setting: {key} is not available on this system"
+    ))
+}
+
+pub fn command_line(key: &str, value: &str) -> String {
+    if validate_setting(key, value).is_err() {
+        return format!("# invalid power setting {key}");
+    }
+    match key {
+        "cpu_epp" => format!("echo {value} | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"),
+        "cpu_governor" => format!("echo {value} | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"),
+        "charge_limit" => {
+            let (b, p) = value.split_once(':').unwrap_or_default();
+            format!("echo {p} | sudo tee /sys/class/power_supply/{b}/charge_control_end_threshold")
+        }
+        "lowpowermode" => format!("sudo pmset -a lowpowermode {value}"),
+        "manager_off" => format!("sudo systemctl disable --now {value} && sudo systemctl mask {value}"),
+        "manager_on" => format!("sudo systemctl unmask {value} && sudo systemctl enable --now {value}"),
+        _ => format!("# power setting {key}"),
+    }
+}
+
+pub async fn ui_action(action: &str, a: Value) -> Result<Value, String> {
+    match action {
+        "set_profile" => {
+            let p = crate::core::llm::tool_table::need_str(&a, "profile")?;
+            if !PROFILES.contains(&p.as_str()) {
+                return Err(format!("unknown profile {p}"));
+            }
+            super::tools::blocking(move || {
+                #[cfg(target_os = "linux")]
+                {
+                    linux::set_profile(&p)?;
+                    return Ok(json!({ "profile": p }));
+                }
+                #[allow(unreachable_code)]
+                Err::<Value, String>(format!("power profiles are a Linux feature ({p})"))
+            })
+            .await
+        }
+        "battery_report" => {
+            super::tools::blocking(|| {
+                #[cfg(windows)]
+                {
+                    let dir = super::data_dir()?.join("reports");
+                    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                    let path = dir.join("battery-report.html");
+                    windows::battery_report(&path)?;
+                    let _ = crate::core::process::std_command("explorer")
+                        .arg(&path)
+                        .spawn();
+                    return Ok(json!({ "path": path }));
+                }
+                #[allow(unreachable_code)]
+                Err::<Value, String>("the battery report is a Windows feature".into())
+            })
+            .await
+        }
+        _ => Err(format!("power: unknown screen action {action}")),
+    }
+}

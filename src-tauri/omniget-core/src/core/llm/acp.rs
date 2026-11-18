@@ -1,0 +1,759 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot, Mutex};
+
+use super::agent::{AgentDef, RuntimeKind};
+use super::broker::{Answer, ToolBroker};
+use super::error::LlmError;
+use super::runtime::AgentRuntime;
+use super::types::{ContentPart, FinishReason, Message, Role, TurnEvent, TurnRequest};
+use crate::core::mcp::stdio::LineFramer;
+
+pub const ERR_ACP: &str = "ERR_LLM_ACP";
+const MAX_LINE: usize = 16 * 1024 * 1024;
+
+type Pending = Arc<StdMutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+
+struct Inbound {
+    id: Option<Value>,
+    method: String,
+    params: Value,
+}
+
+struct Session {
+    stdin: Mutex<tokio::process::ChildStdin>,
+    _child: StdMutex<tokio::process::Child>,
+    pending: Pending,
+    next_id: AtomicI64,
+    dead: Arc<AtomicBool>,
+    inbound: Mutex<mpsc::UnboundedReceiver<Inbound>>,
+    session_id: String,
+    cwd: PathBuf,
+    command: String,
+    load_session: bool,
+    grant_id: Option<String>,
+}
+
+struct StartOptions {
+    mcp_server: Option<Value>,
+    grant_id: Option<String>,
+    load: Option<String>,
+}
+
+impl Session {
+    async fn write(&self, msg: &Value) -> Result<(), String> {
+        let mut line = serde_json::to_vec(msg).map_err(|e| e.to_string())?;
+        line.push(b'\n');
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(&line).await.map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())
+    }
+
+    fn register(&self) -> (i64, oneshot::Receiver<Result<Value, String>>) {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
+        (id, rx)
+    }
+}
+
+fn spawn_reader(
+    stdout: tokio::process::ChildStdout,
+    pending: Pending,
+    dead: Arc<AtomicBool>,
+    tx: mpsc::UnboundedSender<Inbound>,
+) {
+    tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut framer = LineFramer::new(MAX_LINE);
+        let mut buf = vec![0u8; 16 * 1024];
+        let handle = |line: &[u8]| {
+            let Ok(msg) = serde_json::from_slice::<Value>(line) else {
+                return;
+            };
+            if let Some(method) = msg.get("method").and_then(Value::as_str) {
+                let _ = tx.send(Inbound {
+                    id: msg.get("id").cloned().filter(|v| !v.is_null()),
+                    method: method.to_string(),
+                    params: msg.get("params").cloned().unwrap_or(Value::Null),
+                });
+                return;
+            }
+            let Some(id) = msg.get("id").and_then(Value::as_i64) else {
+                return;
+            };
+            let waiter = pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            if let Some(waiter) = waiter {
+                let _ = waiter.send(match msg.get("error") {
+                    Some(err) if !err.is_null() => Err(err
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("agent error")
+                        .to_string()),
+                    _ => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                });
+            }
+        };
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => framer.push(&buf[..n], handle),
+            }
+        }
+        dead.store(true, Ordering::SeqCst);
+        let waiting: Vec<_> = pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .collect();
+        for (_, w) in waiting {
+            let _ = w.send(Err("the ACP agent closed its output".into()));
+        }
+    });
+}
+
+async fn start(
+    command: &str,
+    args: &[String],
+    cwd: PathBuf,
+    opts: StartOptions,
+) -> Result<(Arc<Session>, bool), String> {
+    let mut cmd = crate::core::process::command(command);
+    cmd.args(args)
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    if command.contains("claude-code-acp") && std::env::var_os("CLAUDE_CODE_EXECUTABLE").is_none() {
+        let found = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join("claude"))
+                .find(|p| p.is_file())
+        });
+        if let Some(claude) = found {
+            cmd.env("CLAUDE_CODE_EXECUTABLE", claude);
+        }
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start `{command}`: {e}"))?;
+    let stdin = child.stdin.take().ok_or("no stdin")?;
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let pending: Pending = Arc::new(StdMutex::new(HashMap::new()));
+    let dead = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::unbounded_channel();
+    spawn_reader(stdout, pending.clone(), dead.clone(), tx);
+
+    let mut session = Session {
+        stdin: Mutex::new(stdin),
+        _child: StdMutex::new(child),
+        pending,
+        next_id: AtomicI64::new(1),
+        dead,
+        inbound: Mutex::new(rx),
+        session_id: String::new(),
+        cwd: cwd.clone(),
+        command: command.to_string(),
+        load_session: false,
+        grant_id: None,
+    };
+    let call = |s: &Session, method: &str, params: Value| {
+        let (id, rx) = s.register();
+        (
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+            rx,
+        )
+    };
+    let wait = |rx: oneshot::Receiver<Result<Value, String>>| async move {
+        match tokio::time::timeout(std::time::Duration::from_secs(60), rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err("the ACP agent went away".to_string()),
+            Err(_) => Err("the ACP agent did not answer in 60 s".to_string()),
+        }
+    };
+    let (msg, rx) = call(
+        &session,
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": { "fs": { "readTextFile": true, "writeTextFile": true }, "terminal": false },
+            "clientInfo": { "name": "omniget", "version": env!("CARGO_PKG_VERSION") },
+        }),
+    );
+    session.write(&msg).await?;
+    let init = wait(rx).await.map_err(|e| format!("initialize: {e}"))?;
+    let caps = &init["agentCapabilities"];
+    session.load_session = caps["loadSession"].as_bool().unwrap_or(false);
+    let http = caps["mcpCapabilities"]["http"].as_bool().unwrap_or(false);
+    let servers: Vec<Value> = match (&opts.mcp_server, http) {
+        (Some(server), true) => {
+            session.grant_id = opts.grant_id.clone();
+            vec![server.clone()]
+        }
+        _ => Vec::new(),
+    };
+    if let (Some(id), true) = (&opts.load, session.load_session) {
+        let (msg, rx) = call(
+            &session,
+            "session/load",
+            json!({ "sessionId": id, "cwd": cwd.to_string_lossy(), "mcpServers": servers }),
+        );
+        session.write(&msg).await?;
+        if wait(rx).await.is_ok() {
+            session.session_id = id.clone();
+            if let Ok(mut inbound) = session.inbound.try_lock() {
+                while inbound.try_recv().is_ok() {}
+            }
+            return Ok((Arc::new(session), true));
+        }
+    }
+    let (msg, rx) = call(
+        &session,
+        "session/new",
+        json!({ "cwd": cwd.to_string_lossy(), "mcpServers": servers }),
+    );
+    session.write(&msg).await?;
+    let created = wait(rx)
+        .await
+        .map_err(|e| format!("session/new: {e} (is the CLI logged in?)"))?;
+    session.session_id = created["sessionId"]
+        .as_str()
+        .ok_or("session/new returned no sessionId")?
+        .to_string();
+    Ok((Arc::new(session), false))
+}
+
+pub struct AcpRuntime {
+    broker: Arc<ToolBroker>,
+    sessions: Mutex<HashMap<String, Arc<Session>>>,
+}
+
+impl AcpRuntime {
+    pub fn new(broker: Arc<ToolBroker>) -> Self {
+        Self {
+            broker,
+            sessions: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+fn text_of(message: &Message) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn prompt_for(req: &TurnRequest, fresh: bool) -> String {
+    let last_user = req.messages.iter().rposition(|m| m.role == Role::User);
+    let last = last_user
+        .map(|i| text_of(&req.messages[i]))
+        .unwrap_or_default();
+    if !fresh {
+        return last;
+    }
+    let mut out = String::new();
+    for (i, m) in req.messages.iter().enumerate() {
+        if Some(i) == last_user {
+            continue;
+        }
+        let text = text_of(m);
+        if text.trim().is_empty() {
+            continue;
+        }
+        let who = match m.role {
+            Role::System => "Instructions",
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::Tool => continue,
+        };
+        out.push_str(&format!("[{who}]\n{text}\n\n"));
+    }
+    if out.is_empty() {
+        last
+    } else {
+        format!("{out}[User]\n{last}")
+    }
+}
+
+fn inside(cwd: &std::path::Path, raw: &str) -> Result<PathBuf, String> {
+    super::drivers::acp::client::contained(cwd, raw)
+        .map_err(|_| format!("{}: {raw}", super::code_tools::ERR_OUTSIDE))
+}
+
+fn permission_tool(kind: &str) -> String {
+    if kind == "execute" {
+        "shell_exec".into()
+    } else {
+        format!("acp:{kind}")
+    }
+}
+
+fn always_rule(kind: &str, subject: &Value) -> super::perm::Rule {
+    if kind == "execute" {
+        super::perm::always_rule("shell_exec", subject)
+    } else {
+        super::perm::Rule {
+            tool: permission_tool(kind),
+            pattern: "*".into(),
+            action: super::perm::Action::Allow,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for AcpRuntime {
+    async fn turn(
+        &self,
+        agent: &AgentDef,
+        req: TurnRequest,
+    ) -> Result<BoxStream<'static, TurnEvent>, LlmError> {
+        let RuntimeKind::Acp { command, args } = &agent.runtime else {
+            return Err(LlmError::new(
+                ERR_ACP,
+                format!("agent `{}` is not an ACP agent", agent.id),
+            ));
+        };
+        let ctx = super::code_tools::current_turn();
+        let conversation = ctx
+            .as_ref()
+            .map(|c| c.conversation.clone())
+            .unwrap_or_else(|| format!("acp-{}", agent.id));
+        let request_id = ctx.as_ref().map(|c| c.request.clone()).unwrap_or_default();
+        let workspace = ctx
+            .as_ref()
+            .and_then(|c| super::code_tools::workspace_of(&c.conversation));
+        let projectless = ctx.is_some() && workspace.is_none();
+        let cwd = match (&ctx, workspace) {
+            (_, Some(ws)) => ws,
+            (Some(_), None) => super::roster_store::llm_dir()
+                .map(|d| d.join("sandboxes").join(&agent.id))
+                .filter(|d| std::fs::create_dir_all(d).is_ok())
+                .unwrap_or_else(std::env::temp_dir),
+            (None, None) => super::code_tools::workspace()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(std::env::temp_dir),
+        };
+        let registry = crate::core::assist::runs::active();
+        let tools = crate::core::assist::projection::granted_tools(&self.broker, &agent.tools);
+        let has_history = req.messages.iter().any(|m| m.role == Role::Assistant);
+
+        let key = format!("{conversation}\u{0}{}", agent.id);
+        let (session, fresh, loaded) = {
+            let mut sessions = self.sessions.lock().await;
+            let live = sessions
+                .get(&key)
+                .filter(|s| !s.dead.load(Ordering::SeqCst) && s.cwd == cwd && &s.command == command)
+                .cloned();
+            match live {
+                Some(s) => (s, false, false),
+                None => {
+                    let (mcp_server, grant_id) =
+                        match (&registry, crate::core::assist::projection::endpoint()) {
+                            (Some(reg), Some(url)) => match crate::core::assist::projection::issue(
+                                reg.db(),
+                                &agent.id,
+                                &conversation,
+                                Some(&request_id),
+                                &tools,
+                                false,
+                                crate::core::assist::projection::DEFAULT_TTL_MS,
+                            ) {
+                                Ok(issued) => {
+                                    crate::core::assist::projection::attach_broker(
+                                        &issued.id,
+                                        self.broker.clone(),
+                                    );
+                                    (
+                                        Some(crate::core::assist::projection::acp_mcp_server(
+                                            &url,
+                                            &issued.token,
+                                        )),
+                                        Some(issued.id),
+                                    )
+                                }
+                                Err(_) => (None, None),
+                            },
+                            _ => (None, None),
+                        };
+                    let load = registry.as_ref().and_then(|reg| {
+                        reg.session(&conversation, &agent.id)
+                            .filter(|s| {
+                                s.runtime == format!("acp:{command}")
+                                    && s.cwd.as_deref() == Some(&*cwd.to_string_lossy())
+                            })
+                            .and_then(|s| s.provider_handle)
+                    });
+                    let (s, loaded) = start(
+                        command,
+                        args,
+                        cwd.clone(),
+                        StartOptions {
+                            mcp_server,
+                            grant_id: grant_id.clone(),
+                            load,
+                        },
+                    )
+                    .await
+                    .map_err(|e| LlmError::new(ERR_ACP, e))?;
+                    if s.grant_id.is_none() {
+                        if let (Some(reg), Some(id)) = (&registry, &grant_id) {
+                            crate::core::assist::projection::revoke(reg.db(), id);
+                        }
+                    }
+                    sessions.insert(key, s.clone());
+                    (s, true, loaded)
+                }
+            }
+        };
+        if let (Some(reg), Some(id)) = (&registry, &session.grant_id) {
+            let _ = crate::core::assist::projection::refresh(
+                reg.db(),
+                id,
+                Some(&request_id),
+                &tools,
+                crate::core::assist::projection::DEFAULT_TTL_MS,
+            );
+        }
+        let resume_kind = if !fresh || loaded {
+            crate::core::assist::runs::ResumeKind::Native
+        } else if has_history {
+            crate::core::assist::runs::ResumeKind::Replay
+        } else {
+            crate::core::assist::runs::ResumeKind::New
+        };
+        if let Some(reg) = &registry {
+            let pins = crate::core::assist::runs::SessionPins {
+                runtime: format!("acp:{command}"),
+                account: None,
+                exe_version: None,
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                context_kind: if projectless {
+                    "projectless"
+                } else {
+                    "project"
+                }
+                .into(),
+                native_resume: session.load_session,
+            };
+            if let Ok((rec, _)) = reg.open_session(&conversation, &agent.id, &pins) {
+                let _ = reg.set_handle(&rec.id, &session.session_id);
+                let _ = reg.bind_session(
+                    &request_id,
+                    &rec.id,
+                    resume_kind,
+                    Some(&cwd.to_string_lossy()),
+                );
+            }
+        }
+        let fresh = fresh && !loaded;
+
+        let (tx, rx) = mpsc::channel::<TurnEvent>(256);
+        let broker = self.broker.clone();
+        let agent_id = agent.id.clone();
+        let cancel = req.cancel.clone();
+        let prompt = prompt_for(&req, fresh);
+        let run_registry = registry.clone();
+        tokio::spawn(async move {
+            let _ = tx
+                .send(TurnEvent::Started {
+                    request_id: request_id.clone(),
+                })
+                .await;
+            let (id, mut done) = session.register();
+            let msg = json!({ "jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                "params": { "sessionId": session.session_id, "prompt": [{ "type": "text", "text": prompt }] } });
+            if let Err(e) = session.write(&msg).await {
+                let _ = tx
+                    .send(TurnEvent::Error {
+                        error: LlmError::new(ERR_ACP, e),
+                    })
+                    .await;
+                let _ = tx
+                    .send(TurnEvent::Finished {
+                        reason: FinishReason::Other,
+                    })
+                    .await;
+                return;
+            }
+            let mut inbound = session.inbound.lock().await;
+            let mut cancelled = false;
+            let reason = loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if !cancelled => {
+                        cancelled = true;
+                        let _ = session.write(&json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session.session_id } })).await;
+                    }
+                    result = &mut done => {
+                        break match result {
+                            Ok(Ok(v)) => match v["stopReason"].as_str() {
+                                Some("cancelled") => FinishReason::Cancelled,
+                                Some("max_tokens") | Some("max_turn_requests") => FinishReason::Length,
+                                _ => FinishReason::Stop,
+                            },
+                            Ok(Err(e)) => {
+                                let _ = tx.send(TurnEvent::Error { error: LlmError::new(ERR_ACP, e) }).await;
+                                FinishReason::Other
+                            }
+                            Err(_) => FinishReason::Other,
+                        };
+                    }
+                    Some(msg) = inbound.recv() => {
+                        let reply = handle_inbound(&msg, &session, &broker, &agent_id, &conversation, &request_id, &tx, run_registry.as_ref()).await;
+                        if let (Some(id), Some(reply)) = (msg.id.clone(), reply) {
+                            let body = match reply {
+                                Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                                Err(message) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": message } }),
+                            };
+                            let _ = session.write(&body).await;
+                        }
+                    }
+                }
+            };
+            let reason = if cancelled {
+                FinishReason::Cancelled
+            } else {
+                reason
+            };
+            let _ = tx.send(TurnEvent::Finished { reason }).await;
+        });
+        Ok(
+            futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) })
+                .boxed(),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_inbound(
+    msg: &Inbound,
+    session: &Session,
+    broker: &ToolBroker,
+    agent_id: &str,
+    conversation: &str,
+    request_id: &str,
+    tx: &mpsc::Sender<TurnEvent>,
+    registry: Option<&crate::core::assist::runs::Registry>,
+) -> Option<Result<Value, String>> {
+    let p = &msg.params;
+    match msg.method.as_str() {
+        "session/update" => {
+            let u = &p["update"];
+            let chunk = u["content"]["text"].as_str().unwrap_or("").to_string();
+            match u["sessionUpdate"].as_str().unwrap_or("") {
+                "agent_message_chunk" if !chunk.is_empty() => {
+                    let _ = tx.send(TurnEvent::TextDelta { text: chunk }).await;
+                }
+                "agent_thought_chunk" if !chunk.is_empty() => {
+                    let _ = tx.send(TurnEvent::ThinkingDelta { text: chunk }).await;
+                }
+                "tool_call" | "tool_call_update"
+                    if registry.is_some() && u["toolCallId"].is_string() =>
+                {
+                    if let Some(reg) = registry {
+                        let id = u["toolCallId"].as_str().unwrap_or("");
+                        let status = u["status"].as_str().unwrap_or("pending");
+                        let _ = reg.add_event(
+                            request_id,
+                            "tool_call",
+                            Some(&format!("{id}:{status}")),
+                            json!({
+                                "name": u["title"].as_str().or(u["kind"].as_str()).unwrap_or("tool"),
+                                "input": u.get("rawInput").cloned().unwrap_or(Value::Null),
+                                "status": status,
+                                "runtime": "acp",
+                            }),
+                        );
+                    }
+                    if u["sessionUpdate"] == "tool_call" {
+                        let title = u["title"].as_str().unwrap_or("tool");
+                        let _ = tx
+                            .send(TurnEvent::ThinkingDelta {
+                                text: format!("\n→ {title}\n"),
+                            })
+                            .await;
+                    }
+                }
+                "tool_call" => {
+                    let title = u["title"].as_str().unwrap_or("tool");
+                    let _ = tx
+                        .send(TurnEvent::ThinkingDelta {
+                            text: format!("\n→ {title}\n"),
+                        })
+                        .await;
+                }
+                "plan" => {
+                    let steps: Vec<String> = u["entries"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|e| {
+                            format!(
+                                "  [{}] {}",
+                                e["status"].as_str().unwrap_or("pending"),
+                                e["content"].as_str().unwrap_or("")
+                            )
+                        })
+                        .collect();
+                    if !steps.is_empty() {
+                        let _ = tx
+                            .send(TurnEvent::ThinkingDelta {
+                                text: format!("\nPlan:\n{}\n", steps.join("\n")),
+                            })
+                            .await;
+                    }
+                }
+                _ => {}
+            }
+            None
+        }
+        "session/request_permission" => {
+            let call = &p["toolCall"];
+            let title = call["title"].as_str().unwrap_or("tool call");
+            let kind = call["kind"].as_str().unwrap_or("other");
+            let call_id = call["toolCallId"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let raw = call
+                .get("rawInput")
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let preview = format!("{title}\n{raw}");
+            let label = format!("acp:{kind}");
+            let subject = json!({ "command": title });
+            let preallowed = super::run_mode::of(conversation)
+                .and_then(|m| super::run_mode::acp_preallowed(m, kind))
+                .unwrap_or(false);
+            let answer = match super::perm::decide(agent_id, &permission_tool(kind), &subject) {
+                Some(super::perm::Action::Allow) => Answer::Once,
+                Some(super::perm::Action::Deny) => Answer::Deny,
+                _ if preallowed => Answer::Once,
+                _ => {
+                    broker
+                        .ask_user(agent_id, request_id, &call_id, &label, &preview)
+                        .await
+                }
+            };
+            if matches!(answer, Answer::Always) {
+                super::perm::add_rule(agent_id, always_rule(kind, &subject));
+            }
+            let want: &[&str] = match answer {
+                Answer::Always => &["allow_always", "allow_once"],
+                Answer::Once => &["allow_once", "allow_always"],
+                Answer::Deny => &["reject_once", "reject_always"],
+            };
+            let options = p["options"].as_array().cloned().unwrap_or_default();
+            let pick = want
+                .iter()
+                .find_map(|k| options.iter().find(|o| o["kind"].as_str() == Some(k)));
+            Some(Ok(match pick.and_then(|o| o["optionId"].as_str()) {
+                Some(id) => json!({ "outcome": { "outcome": "selected", "optionId": id } }),
+                None => json!({ "outcome": { "outcome": "cancelled" } }),
+            }))
+        }
+        "fs/read_text_file" => Some(
+            super::drivers::acp::client::read_text_file(&session.cwd, p).map_err(|e| e.message),
+        ),
+        "fs/write_text_file" => {
+            let path = match inside(&session.cwd, p["path"].as_str().unwrap_or("")) {
+                Ok(path) => path,
+                Err(e) => return Some(Err(e)),
+            };
+            let _ = super::snapshot::before_write(&session.cwd, conversation, request_id).await;
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            Some(
+                std::fs::write(&path, p["content"].as_str().unwrap_or(""))
+                    .map(|_| Value::Null)
+                    .map_err(|e| e.to_string()),
+            )
+        }
+        _ if msg.id.is_some() => Some(Err(format!(
+            "method `{}` is not supported by this client",
+            msg.method
+        ))),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn always_on_an_execute_permission_only_covers_that_command() {
+        let rule = always_rule("execute", &json!({ "command": "git status" }));
+        assert_eq!(rule.tool, "shell_exec");
+        assert_eq!(rule.pattern, "git status *");
+        let rules = [rule];
+        let decide = |command: &str| {
+            super::super::perm::decide_in(
+                &rules,
+                &permission_tool("execute"),
+                &json!({ "command": command }),
+            )
+        };
+        assert_eq!(
+            decide("git status --short"),
+            Some(super::super::perm::Action::Allow)
+        );
+        assert_eq!(decide("rm -rf /"), None);
+    }
+
+    #[test]
+    fn an_old_blanket_execute_rule_no_longer_applies() {
+        let rules = [super::super::perm::Rule {
+            tool: "acp:execute".into(),
+            pattern: "*".into(),
+            action: super::super::perm::Action::Allow,
+        }];
+        assert_eq!(
+            super::super::perm::decide_in(
+                &rules,
+                &permission_tool("execute"),
+                &json!({ "command": "rm -rf /" }),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn always_on_other_kinds_keeps_the_kind_wide_rule() {
+        let rule = always_rule("edit", &json!({ "command": "Edit a.rs" }));
+        assert_eq!(rule.tool, "acp:edit");
+        assert_eq!(rule.pattern, "*");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_workspace_is_outside() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(other.path(), root.path().join("link")).unwrap();
+        assert!(inside(root.path(), "link/escaped.txt").is_err());
+        assert!(inside(root.path(), "plain/new.txt").is_ok());
+    }
+}

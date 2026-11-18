@@ -1,0 +1,273 @@
+use std::time::Duration;
+
+use serde::Serialize;
+use serde_json::{json, Value};
+
+const ALLOWED: &[&str] = &[
+    "aria2.getVersion",
+    "aria2.getGlobalStat",
+    "aria2.addUri",
+    "aria2.tellActive",
+    "aria2.tellWaiting",
+    "aria2.tellStopped",
+    "aria2.pause",
+    "aria2.unpause",
+    "aria2.remove",
+    "aria2.removeDownloadResult",
+];
+
+const TASK_KEYS: &[&str] = &[
+    "gid",
+    "status",
+    "totalLength",
+    "completedLength",
+    "downloadSpeed",
+    "errorMessage",
+    "files",
+    "bittorrent",
+];
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RemoteTask {
+    pub gid: String,
+    pub status: String,
+    pub name: String,
+    pub total: u64,
+    pub done: u64,
+    pub speed: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RemoteOverview {
+    pub version: String,
+    pub download_speed: u64,
+    pub tasks: Vec<RemoteTask>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AddResult {
+    pub added: usize,
+    pub failed: Vec<String>,
+}
+
+pub fn normalize_endpoint(input: &str) -> Result<String, String> {
+    let s = input.trim().trim_end_matches('/');
+    if s.is_empty() {
+        return Err("ARIA2_NO_ADDRESS".into());
+    }
+    let had_scheme = s.starts_with("http://") || s.starts_with("https://");
+    let with_scheme = if had_scheme {
+        s.to_string()
+    } else if s.contains("://") {
+        return Err("ARIA2_BAD_ADDRESS".into());
+    } else {
+        format!("http://{s}")
+    };
+    let mut url = url::Url::parse(&with_scheme).map_err(|_| "ARIA2_BAD_ADDRESS".to_string())?;
+    if url.host_str().is_none() {
+        return Err("ARIA2_BAD_ADDRESS".into());
+    }
+    if url.path() == "/" || url.path().is_empty() {
+        url.set_path("/jsonrpc");
+    }
+    if !had_scheme && url.port().is_none() {
+        let _ = url.set_port(Some(6800));
+    }
+    Ok(url.to_string())
+}
+
+pub fn parse_links(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| {
+            let l = l.to_ascii_lowercase();
+            ["http://", "https://", "ftp://", "sftp://", "magnet:?"]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn params_with_token(secret: &str, params: Vec<Value>) -> Vec<Value> {
+    let mut out = Vec::with_capacity(params.len() + 1);
+    if !secret.is_empty() {
+        out.push(Value::String(format!("token:{secret}")));
+    }
+    out.extend(params);
+    out
+}
+
+async fn call(
+    endpoint: &str,
+    secret: &str,
+    method: &str,
+    params: Vec<Value>,
+) -> Result<Value, String> {
+    if !ALLOWED.contains(&method) {
+        return Err("ARIA2_METHOD_NOT_ALLOWED".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": "omniget",
+        "method": method,
+        "params": params_with_token(secret, params),
+    });
+    let res = client
+        .post(endpoint)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| "ARIA2_UNREACHABLE".to_string())?;
+    let status = res.status();
+    let value: Value = res.json().await.map_err(|_| {
+        if status.is_success() {
+            "ARIA2_NOT_ARIA2".to_string()
+        } else {
+            format!("ARIA2_HTTP_{}", status.as_u16())
+        }
+    })?;
+    if let Some(err) = value.get("error") {
+        let msg = err.get("message").and_then(Value::as_str).unwrap_or("");
+        if msg.eq_ignore_ascii_case("unauthorized") {
+            return Err("ARIA2_UNAUTHORIZED".into());
+        }
+        return Err(format!("ARIA2_ERROR|{msg}"));
+    }
+    Ok(value.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn num(v: &Value, key: &str) -> u64 {
+    v.get(key)
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn task_name(v: &Value) -> String {
+    if let Some(name) = v
+        .pointer("/bittorrent/info/name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
+    let first = v.pointer("/files/0");
+    let path = first
+        .and_then(|f| f.get("path"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !path.is_empty() {
+        return path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
+    }
+    first
+        .and_then(|f| f.pointer("/uris/0/uri"))
+        .and_then(Value::as_str)
+        .map(crate::core::flight_recorder::redact_url)
+        .unwrap_or_default()
+}
+
+pub fn to_task(v: &Value) -> RemoteTask {
+    RemoteTask {
+        gid: v
+            .get("gid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        status: v
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        name: task_name(v),
+        total: num(v, "totalLength"),
+        done: num(v, "completedLength"),
+        speed: num(v, "downloadSpeed"),
+        error: v
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    }
+}
+
+#[tauri::command]
+pub async fn aria2_remote_overview(
+    address: String,
+    secret: String,
+) -> Result<RemoteOverview, String> {
+    let endpoint = normalize_endpoint(&address)?;
+    let version = call(&endpoint, &secret, "aria2.getVersion", vec![]).await?;
+    let stat = call(&endpoint, &secret, "aria2.getGlobalStat", vec![]).await?;
+    let keys = json!(TASK_KEYS);
+    let mut tasks = Vec::new();
+    for (method, extra) in [
+        ("aria2.tellActive", vec![keys.clone()]),
+        ("aria2.tellWaiting", vec![json!(0), json!(50), keys.clone()]),
+        ("aria2.tellStopped", vec![json!(0), json!(20), keys.clone()]),
+    ] {
+        if let Value::Array(list) = call(&endpoint, &secret, method, extra).await? {
+            tasks.extend(list.iter().map(to_task));
+        }
+    }
+    Ok(RemoteOverview {
+        version: version
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        download_speed: num(&stat, "downloadSpeed"),
+        tasks,
+    })
+}
+
+#[tauri::command]
+pub async fn aria2_remote_add(
+    address: String,
+    secret: String,
+    links: String,
+) -> Result<AddResult, String> {
+    let endpoint = normalize_endpoint(&address)?;
+    let links = parse_links(&links);
+    if links.is_empty() {
+        return Err("ARIA2_NO_LINKS".into());
+    }
+    let mut added = 0;
+    let mut failed = Vec::new();
+    for link in links {
+        match call(&endpoint, &secret, "aria2.addUri", vec![json!([link])]).await {
+            Ok(_) => added += 1,
+            Err(e) if e == "ARIA2_UNAUTHORIZED" || e == "ARIA2_UNREACHABLE" => return Err(e),
+            Err(_) => failed.push(crate::core::flight_recorder::redact_url(&link)),
+        }
+    }
+    Ok(AddResult { added, failed })
+}
+
+#[tauri::command]
+pub async fn aria2_remote_task(
+    address: String,
+    secret: String,
+    gid: String,
+    action: String,
+) -> Result<(), String> {
+    let endpoint = normalize_endpoint(&address)?;
+    if gid.is_empty() || !gid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("ARIA2_BAD_TASK".into());
+    }
+    let method = match action.as_str() {
+        "pause" => "aria2.pause",
+        "resume" => "aria2.unpause",
+        "remove" => "aria2.remove",
+        "clear" => "aria2.removeDownloadResult",
+        _ => return Err("ARIA2_BAD_ACTION".into()),
+    };
+    call(&endpoint, &secret, method, vec![json!(gid)])
+        .await
+        .map(|_| ())
+}

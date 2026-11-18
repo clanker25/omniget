@@ -1,0 +1,205 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use serde_json::Value;
+
+use omniget_core::core::agentkit::{
+    self as ak,
+    model::{Component, ComponentKind},
+    plan::{ConflictPolicy, PlanRequest},
+    Env, Scope,
+};
+
+pub(crate) fn env() -> Result<Env, String> {
+    Env::system().map_err(String::from)
+}
+
+pub(crate) fn project(p: Option<String>) -> Option<PathBuf> {
+    p.filter(|s| !s.trim().is_empty()).map(PathBuf::from)
+}
+
+pub(crate) fn to_value<T: serde::Serialize>(v: T) -> Result<Value, String> {
+    serde_json::to_value(v).map_err(|e| format!("AGENTKIT_JSON: {e}"))
+}
+
+async fn blocking<T, F>(f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("AGENTKIT_TASK: {e}"))?
+}
+
+#[tauri::command]
+pub async fn agentkit_targets() -> Result<Value, String> {
+    let env = env()?;
+    to_value(ak::targets::load_targets(&env))
+}
+
+#[tauri::command]
+pub async fn agentkit_parse_preview(
+    kind: Option<String>,
+    path: Option<String>,
+    entry: Option<String>,
+    files: Option<BTreeMap<String, String>>,
+    item: Option<Value>,
+) -> Result<Value, String> {
+    blocking(move || {
+        let raw: Option<ak::parse::RawFiles> =
+            files.map(|m| m.into_iter().map(|(k, v)| (k, v.into_bytes())).collect());
+        let mut c: Component = match (item, path, entry, raw) {
+            (Some(item), _, _, Some(raw)) => ak::parse::parse_item(&item, &raw)?,
+            (_, Some(p), _, _) => {
+                let k = kind
+                    .as_deref()
+                    .and_then(ComponentKind::parse)
+                    .ok_or("AGENTKIT_KIND: kind is required with path")?;
+                ak::parse::parse_path(k, &PathBuf::from(p))?
+            }
+            (_, _, Some(e), Some(raw)) => {
+                let k = kind
+                    .as_deref()
+                    .and_then(ComponentKind::parse)
+                    .ok_or("AGENTKIT_KIND: kind is required with entry")?;
+                ak::parse::parse_raw(k, &e, &raw)?
+            }
+            _ => return Err("AGENTKIT_ARGS: pass path, entry+files or item+files".into()),
+        };
+        let env = env()?;
+        c.compat = ak::convert::compute_compat(&c, &ak::targets::load_targets(&env));
+        to_value(c)
+    })
+    .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn agentkit_plan(
+    components_json: Option<Value>,
+    catalog_ids: Option<Vec<String>>,
+    targets: Vec<String>,
+    scope: Option<String>,
+    project_dir: Option<String>,
+    policy: Option<String>,
+    secret_values: Option<BTreeMap<String, String>>,
+) -> Result<Value, String> {
+    blocking(move || {
+        let mut components: Vec<Component> = match components_json {
+            Some(Value::Array(a)) => a
+                .into_iter()
+                .map(|v| serde_json::from_value(v).map_err(|e| format!("AGENTKIT_JSON: {e}")))
+                .collect::<Result<_, _>>()?,
+            Some(Value::Object(o)) => vec![serde_json::from_value(Value::Object(o))
+                .map_err(|e| format!("AGENTKIT_JSON: {e}"))?],
+            Some(Value::String(s)) => serde_json::from_str::<Vec<Component>>(&s)
+                .map_err(|e| format!("AGENTKIT_JSON: {e}"))?,
+            _ => vec![],
+        };
+        for id in catalog_ids.unwrap_or_default() {
+            components.push(resolve_any(&id)?);
+        }
+        if components.is_empty() {
+            return Err("AGENTKIT_ARGS: nothing to install".into());
+        }
+        let policy = match policy.as_deref().unwrap_or("rename") {
+            "skip" => ConflictPolicy::Skip,
+            "overwrite" => ConflictPolicy::Overwrite,
+            _ => ConflictPolicy::Rename,
+        };
+        let scope = scope.as_deref().map(Scope::parse).transpose()?;
+        let env = env()?;
+        let plan = ak::plan::plan(
+            &env,
+            PlanRequest {
+                components,
+                targets,
+                scope,
+                project_dir: project(project_dir),
+                policy,
+                secret_values: secret_values.unwrap_or_default(),
+            },
+        )?;
+        to_value(plan)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn agentkit_apply(plan_id: String) -> Result<Value, String> {
+    blocking(move || {
+        let plan = ak::plan::get(&plan_id)
+            .ok_or_else(|| format!("AGENTKIT_PLAN: plan `{plan_id}` not found (plan again)"))?;
+        let env = env()?;
+        let report = ak::writer::apply(&env, &plan)?;
+        ak::plan::take(&plan_id);
+        to_value(report)
+    })
+    .await
+}
+
+pub fn resolve_any(id: &str) -> Result<Component, String> {
+    super::catalog::install_catalog_resolver();
+    if let Some(p) = id.strip_prefix("omniget:profiles/") {
+        return Ok(ak::profiles::component(p, &Value::Null)?);
+    }
+    Ok(ak::plan::resolve_id(id)?)
+}
+
+pub fn compat_report(
+    item_id: &str,
+    project_dir: Option<&std::path::Path>,
+) -> Result<Value, String> {
+    let c = resolve_any(item_id)?;
+    let env = env()?;
+    let all = ak::targets::load_targets(&env);
+    let compat: BTreeMap<String, ak::model::Compat> = if c.id.starts_with("omniget:profiles/") {
+        ak::profiles::compat(&c, &all).into_iter().collect()
+    } else {
+        ak::convert::compute_compat(&c, &all)
+    };
+    let detected = ak::detect::detect_all(&env, project_dir);
+    let mut rows: Vec<Value> = detected
+        .iter()
+        .map(|d| {
+            let cp = compat
+                .get(&d.id)
+                .cloned()
+                .unwrap_or(ak::model::Compat::Unsupported {
+                    reason: "unknown tool".into(),
+                });
+            serde_json::json!({
+                "id": d.id,
+                "name": d.name,
+                "installed": d.installed,
+                "beta": d.beta,
+                "enabled_by_default": d.enabled_by_default,
+                "tier": d.tier,
+                "compat": cp,
+            })
+        })
+        .collect();
+    rows.sort_by_key(|r| {
+        (
+            !r["installed"].as_bool().unwrap_or(false),
+            r["compat"]["status"].as_str() == Some("unsupported"),
+            r["tier"].as_u64().unwrap_or(9),
+        )
+    });
+    Ok(serde_json::json!({
+        "id": c.id,
+        "name": c.name,
+        "kind": c.kind,
+        "description": c.description,
+        "targets": rows,
+    }))
+}
+
+pub fn parse_policy(p: Option<&str>) -> ConflictPolicy {
+    match p.unwrap_or("rename") {
+        "skip" => ConflictPolicy::Skip,
+        "overwrite" => ConflictPolicy::Overwrite,
+        _ => ConflictPolicy::Rename,
+    }
+}

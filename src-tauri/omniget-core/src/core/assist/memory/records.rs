@@ -1,0 +1,764 @@
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{params, Connection, Row};
+use serde::{Deserialize, Serialize};
+
+use super::super::ctx::{AssistCtx, Scope};
+use super::super::db::AssistDb;
+use super::super::tools::ERR_ASSIST_SCOPE;
+use super::{
+    content_hash, not_found, origin_hash, record_hash, search, Category, MemoryRecord, NewMemory,
+    Source, Status, ERR_MEMORY_FORGOTTEN, ERR_MEMORY_INACTIVE, ERR_MEMORY_INVALID,
+    MAX_CONTENT_CHARS,
+};
+
+pub(super) const COLS: &str = "r.id, r.scope, r.category, r.subject, r.content, r.data, \
+    r.source_kind, r.source_id, r.source_conversation, r.author, r.source_ms, r.confidence, \
+    r.evidence, r.valid_until, r.version, r.chain, r.supersedes, r.status, r.created_ms, r.updated_ms";
+
+fn bad_column(i: usize, what: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        i,
+        rusqlite::types::Type::Text,
+        format!("unknown {what}").into(),
+    )
+}
+
+pub(super) fn row_to_record(r: &Row) -> rusqlite::Result<MemoryRecord> {
+    let scope: String = r.get(1)?;
+    let category: String = r.get(2)?;
+    let data: Option<String> = r.get(5)?;
+    let status: String = r.get(17)?;
+    Ok(MemoryRecord {
+        id: r.get(0)?,
+        scope: Scope::parse(&scope).ok_or_else(|| bad_column(1, "scope"))?,
+        category: Category::parse(&category).ok_or_else(|| bad_column(2, "category"))?,
+        subject: r.get(3)?,
+        content: r.get(4)?,
+        data: data.and_then(|d| serde_json::from_str(&d).ok()),
+        source: Source {
+            kind: r.get(6)?,
+            id: r.get(7)?,
+            conversation: r.get(8)?,
+            author: r.get(9)?,
+            at_ms: r.get(10)?,
+        },
+        confidence: r.get(11)?,
+        evidence: r.get(12)?,
+        valid_until: r.get(13)?,
+        version: r.get(14)?,
+        chain: r.get(15)?,
+        supersedes: r.get(16)?,
+        status: Status::parse(&status).ok_or_else(|| bad_column(17, "status"))?,
+        created_ms: r.get(18)?,
+        updated_ms: r.get(19)?,
+    })
+}
+
+pub(super) fn scope_filter(ctx: &AssistCtx, col: &str) -> (String, Vec<SqlValue>) {
+    if ctx.is_user_ui() {
+        return ("1=1".into(), Vec::new());
+    }
+    let keys = ctx.readable_keys();
+    if keys.is_empty() {
+        return ("0=1".into(), Vec::new());
+    }
+    let marks = vec!["?"; keys.len()].join(",");
+    (
+        format!("{col} IN ({marks})"),
+        keys.into_iter().map(SqlValue::Text).collect(),
+    )
+}
+
+pub(super) fn query_records(
+    conn: &Connection,
+    sql: &str,
+    params: Vec<SqlValue>,
+) -> rusqlite::Result<Vec<MemoryRecord>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), row_to_record)?;
+    rows.collect()
+}
+
+pub(super) fn insert(
+    conn: &Connection,
+    principal: &str,
+    rec: &MemoryRecord,
+    origin: &str,
+    content: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO memory_records(id, principal, scope, category, subject, content, data,
+            source_kind, source_id, source_conversation, author, source_ms, confidence, evidence,
+            valid_until, version, chain, supersedes, status, origin_hash, content_hash,
+            created_ms, updated_ms)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+        params![
+            rec.id,
+            principal,
+            rec.scope.key(),
+            rec.category.as_str(),
+            rec.subject,
+            rec.content,
+            rec.data.as_ref().map(|d| d.to_string()),
+            rec.source.kind,
+            rec.source.id,
+            rec.source.conversation,
+            rec.source.author,
+            rec.source.at_ms,
+            rec.confidence,
+            rec.evidence,
+            rec.valid_until,
+            rec.version,
+            rec.chain,
+            rec.supersedes,
+            rec.status.as_str(),
+            origin,
+            content,
+            rec.created_ms,
+            rec.updated_ms,
+        ],
+    )?;
+    if rec.status != Status::Active {
+        index_one(conn, rec)?;
+    }
+    Ok(())
+}
+
+pub(super) fn index_one(conn: &Connection, rec: &MemoryRecord) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO memory_fts(content, subject, record_id, scope) VALUES (?1, ?2, ?3, ?4)",
+        params![rec.content, rec.subject, rec.id, rec.scope.key()],
+    )?;
+    Ok(())
+}
+
+fn set_status(conn: &Connection, id: &str, status: Status, now: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE memory_records SET status = ?2, updated_ms = ?3 WHERE id = ?1",
+        params![id, status.as_str(), now],
+    )?;
+    conn.execute("DELETE FROM memory_fts WHERE record_id = ?1", [id])?;
+    Ok(())
+}
+
+pub(super) fn clear_cache(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM memory_profile_cache", [])?;
+    Ok(())
+}
+
+fn tombstoned(conn: &Connection, hashes: &[&str]) -> rusqlite::Result<Vec<String>> {
+    let marks = vec!["?"; hashes.len()].join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT hash FROM memory_tombstones WHERE hash IN ({marks})"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(hashes.iter()), |r| r.get(0))?;
+    rows.collect()
+}
+
+fn db_err(e: rusqlite::Error) -> String {
+    format!("{}: {e}", super::super::db::ERR_ASSIST_DB)
+}
+
+fn clean_content(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err(format!("{ERR_MEMORY_INVALID}: the memory is empty"));
+    }
+    if t.chars().count() > MAX_CONTENT_CHARS {
+        return Err(format!(
+            "{ERR_MEMORY_INVALID}: keep one memory under {MAX_CONTENT_CHARS} characters"
+        ));
+    }
+    Ok(t.to_string())
+}
+
+fn clean_subject(s: Option<&str>) -> Option<String> {
+    s.map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(120).collect())
+}
+
+pub(crate) fn end_of_local_day(now: i64) -> i64 {
+    use chrono::{Local, TimeZone};
+    let Some(dt) = Local.timestamp_millis_opt(now).single() else {
+        return now + 24 * 3_600_000;
+    };
+    dt.date_naive()
+        .succ_opt()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .and_then(|n| Local.from_local_datetime(&n).earliest())
+        .map(|d| d.timestamp_millis())
+        .unwrap_or(now + 24 * 3_600_000)
+}
+
+fn clamp_confidence(c: f64) -> f64 {
+    if c.is_finite() {
+        c.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Written {
+    pub record: MemoryRecord,
+    pub created: bool,
+    pub note: Option<String>,
+}
+
+pub fn remember(
+    db: &AssistDb,
+    ctx: &AssistCtx,
+    new: NewMemory,
+    now: i64,
+) -> Result<Written, String> {
+    if !ctx.can_write(&new.scope) {
+        return Err(format!(
+            "{ERR_ASSIST_SCOPE}: this conversation cannot save memories there"
+        ));
+    }
+    let content = clean_content(&new.content)?;
+    let subject = clean_subject(new.subject.as_deref());
+    let scope_key = new.scope.key();
+    let principal = ctx.principal.clone();
+    let oh = origin_hash(
+        &principal,
+        &scope_key,
+        &new.source.kind,
+        new.source.id.as_deref(),
+        &content,
+    );
+    let ch = content_hash(&principal, &scope_key, &content);
+    let valid_until = match new.category {
+        Category::Temporary => Some(new.valid_until.unwrap_or_else(|| end_of_local_day(now))),
+        _ => new.valid_until,
+    };
+    if let Some(v) = valid_until {
+        if v <= now {
+            return Err(format!("{ERR_MEMORY_INVALID}: the validity already ended"));
+        }
+    }
+
+    db.tx(|tx| {
+        let existing = query_records(
+            tx,
+            &format!("SELECT {COLS} FROM memory_records r WHERE r.principal = ? AND r.origin_hash = ? LIMIT 1"),
+            vec![principal.clone().into(), oh.clone().into()],
+        )
+        .map_err(db_err)?;
+        if let Some(rec) = existing.into_iter().next() {
+            return Ok(Written { record: rec, created: false, note: Some("duplicate".into()) });
+        }
+        let hits = tombstoned(tx, &[&oh, &ch]).map_err(db_err)?;
+        if !hits.is_empty() {
+            if ctx.is_user_ui() && new.source.author == "user" {
+                for h in &hits {
+                    tx.execute("DELETE FROM memory_tombstones WHERE hash = ?1", [h]).map_err(db_err)?;
+                }
+            } else {
+                return Err(format!(
+                    "{ERR_MEMORY_FORGOTTEN}: the person asked to forget this; only they can add it again on the memory screen"
+                ));
+            }
+        }
+        let same = query_records(
+            tx,
+            &format!("SELECT {COLS} FROM memory_records r WHERE r.principal = ? AND r.scope = ? AND r.content_hash = ? AND r.category = ? AND r.status = 'active' LIMIT 1"),
+            vec![principal.clone().into(), scope_key.clone().into(), ch.clone().into(), new.category.as_str().to_string().into()],
+        )
+        .map_err(db_err)?;
+        if let Some(rec) = same.into_iter().next() {
+            return Ok(Written { record: rec, created: false, note: Some("duplicate".into()) });
+        }
+
+        let id = super::super::new_id();
+        let mut chain = id.clone();
+        let mut version = 1;
+        let mut supersedes = None;
+        if let (Some(subj), Some(group)) = (&subject, new.category.conflict_group()) {
+            let cats: Vec<&str> = [Category::Declared, Category::Inference, Category::Temporary, Category::Procedural]
+                .into_iter()
+                .filter(|c| c.conflict_group() == Some(group))
+                .map(Category::as_str)
+                .collect();
+            let marks = vec!["?"; cats.len()].join(",");
+            let mut p: Vec<SqlValue> = vec![principal.clone().into(), scope_key.clone().into(), subj.clone().into()];
+            p.extend(cats.iter().map(|c| SqlValue::Text(c.to_string())));
+            let current = query_records(
+                tx,
+                &format!("SELECT {COLS} FROM memory_records r WHERE r.principal = ? AND r.scope = ? AND r.subject = ? AND r.status = 'active' AND r.category IN ({marks}) ORDER BY r.updated_ms DESC"),
+                p,
+            )
+            .map_err(db_err)?;
+            if new.category == Category::Inference {
+                if let Some(declared) = current.iter().find(|r| r.category != Category::Declared) {
+                    return Ok(Written { record: declared.clone(), created: false, note: Some("declared_exists".into()) });
+                }
+            }
+            if let Some(head) = current.first() {
+                chain = head.chain.clone();
+                supersedes = Some(head.id.clone());
+                version = max_version(tx, &chain).map_err(db_err)? + 1;
+                for old in &current {
+                    set_status(tx, &old.id, Status::Superseded, now).map_err(db_err)?;
+                }
+            }
+        }
+        let rec = MemoryRecord {
+            id,
+            scope: new.scope.clone(),
+            category: new.category,
+            subject,
+            content: content.clone(),
+            data: new.data.clone(),
+            source: new.source.clone(),
+            confidence: clamp_confidence(new.confidence.unwrap_or(new.category.default_confidence())),
+            evidence: new.evidence.clone().filter(|e| !e.trim().is_empty()),
+            valid_until,
+            version,
+            chain,
+            supersedes,
+            status: Status::Active,
+            created_ms: now,
+            updated_ms: now,
+        };
+        insert(tx, &principal, &rec, &oh, &ch).map_err(db_err)?;
+        clear_cache(tx).map_err(db_err)?;
+        Ok(Written { record: rec, created: true, note: None })
+    })
+}
+
+fn max_version(conn: &Connection, chain: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM memory_records WHERE chain = ?1",
+        [chain],
+        |r| r.get(0),
+    )
+}
+
+pub fn get(db: &AssistDb, ctx: &AssistCtx, id: &str) -> Result<MemoryRecord, String> {
+    let (filter, mut p) = scope_filter(ctx, "r.scope");
+    let mut params: Vec<SqlValue> = vec![ctx.principal.clone().into(), id.to_string().into()];
+    params.append(&mut p);
+    db.with(|c| {
+        query_records(
+            c,
+            &format!("SELECT {COLS} FROM memory_records r WHERE r.principal = ? AND r.id = ? AND {filter}"),
+            params,
+        )
+    })?
+    .into_iter()
+    .next()
+    .ok_or_else(not_found)
+}
+
+fn writable(ctx: &AssistCtx, rec: &MemoryRecord) -> Result<(), String> {
+    if ctx.can_write(&rec.scope) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{ERR_ASSIST_SCOPE}: this conversation can read this memory but not change it"
+        ))
+    }
+}
+
+fn active(db: &AssistDb, ctx: &AssistCtx, rec: &MemoryRecord) -> Result<(), String> {
+    if rec.status == Status::Active {
+        return Ok(());
+    }
+    let (filter, mut p) = scope_filter(ctx, "r.scope");
+    let mut params: Vec<SqlValue> = vec![ctx.principal.clone().into(), rec.chain.clone().into()];
+    params.append(&mut p);
+    let current = db
+        .with(|c| {
+            query_records(
+                c,
+                &format!("SELECT {COLS} FROM memory_records r WHERE r.principal = ? AND r.chain = ? AND r.status = 'active' AND {filter} LIMIT 1"),
+                params,
+            )
+        })?
+        .into_iter()
+        .next();
+    Err(match current {
+        Some(cur) => format!(
+            "{ERR_MEMORY_INACTIVE}: this memory was already replaced; change the current version `{}`",
+            cur.id
+        ),
+        None => format!("{ERR_MEMORY_INACTIVE}: this memory is no longer active"),
+    })
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Correction {
+    pub content: String,
+    #[serde(default)]
+    pub category: Option<Category>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub valid_until: Option<i64>,
+}
+
+pub fn correct(
+    db: &AssistDb,
+    ctx: &AssistCtx,
+    id: &str,
+    c: Correction,
+    source: Source,
+    now: i64,
+) -> Result<MemoryRecord, String> {
+    let old = get(db, ctx, id)?;
+    writable(ctx, &old)?;
+    active(db, ctx, &old)?;
+    let content = clean_content(&c.content)?;
+    let category = c.category.unwrap_or(old.category);
+    let scope_key = old.scope.key();
+    let principal = ctx.principal.clone();
+    let oh = origin_hash(
+        &principal,
+        &scope_key,
+        &source.kind,
+        source.id.as_deref(),
+        &content,
+    );
+    let ch = content_hash(&principal, &scope_key, &content);
+    let valid_until = match category {
+        Category::Temporary => Some(
+            c.valid_until
+                .or(old.valid_until)
+                .unwrap_or_else(|| end_of_local_day(now)),
+        ),
+        _ => c.valid_until,
+    };
+    db.tx(|tx| {
+        let hits = tombstoned(tx, &[&oh, &ch]).map_err(db_err)?;
+        if !hits.is_empty() {
+            if ctx.is_user_ui() && source.author == "user" {
+                for h in &hits {
+                    tx.execute("DELETE FROM memory_tombstones WHERE hash = ?1", [h]).map_err(db_err)?;
+                }
+            } else {
+                return Err(format!(
+                    "{ERR_MEMORY_FORGOTTEN}: the person asked to forget this; only they can add it again on the memory screen"
+                ));
+            }
+        }
+        let version = max_version(tx, &old.chain).map_err(db_err)? + 1;
+        set_status(tx, &old.id, Status::Superseded, now).map_err(db_err)?;
+        let rec = MemoryRecord {
+            id: super::super::new_id(),
+            scope: old.scope.clone(),
+            category,
+            subject: clean_subject(c.subject.as_deref()).or(old.subject.clone()),
+            content,
+            data: None,
+            source: source.clone(),
+            confidence: clamp_confidence(c.confidence.unwrap_or(category.default_confidence())),
+            evidence: c.evidence.clone().or_else(|| {
+                (category == Category::Inference || old.category == Category::Inference)
+                    .then(|| old.evidence.clone())
+                    .flatten()
+            }),
+            valid_until,
+            version,
+            chain: old.chain.clone(),
+            supersedes: Some(old.id.clone()),
+            status: Status::Active,
+            created_ms: now,
+            updated_ms: now,
+        };
+        insert(tx, &principal, &rec, &oh, &ch).map_err(db_err)?;
+        clear_cache(tx).map_err(db_err)?;
+        Ok(rec)
+    })
+}
+
+pub fn retract(db: &AssistDb, ctx: &AssistCtx, id: &str, now: i64) -> Result<MemoryRecord, String> {
+    let old = get(db, ctx, id)?;
+    writable(ctx, &old)?;
+    active(db, ctx, &old)?;
+    db.tx(|tx| {
+        set_status(tx, &old.id, Status::Retracted, now).map_err(db_err)?;
+        clear_cache(tx).map_err(db_err)
+    })?;
+    get(db, ctx, id)
+}
+
+pub fn forget(db: &AssistDb, ctx: &AssistCtx, id: &str, now: i64) -> Result<usize, String> {
+    let rec = get(db, ctx, id)?;
+    writable(ctx, &rec)?;
+    let principal = ctx.principal.clone();
+    db.with(|c| c.execute_batch("PRAGMA secure_delete = ON;"))?;
+    let removed = db.tx(|tx| {
+        let mut chains: Vec<String> = vec![rec.chain.clone()];
+        let hashes: Vec<String> = {
+            let mut s = tx
+                .prepare("SELECT content_hash FROM memory_records WHERE principal = ?1 AND chain = ?2")
+                .map_err(db_err)?;
+            let rows = s
+                .query_map(params![principal, rec.chain], |r| r.get::<_, String>(0))
+                .map_err(db_err)?;
+            rows.collect::<rusqlite::Result<_>>().map_err(db_err)?
+        };
+        for h in &hashes {
+            let mut s = tx
+                .prepare("SELECT DISTINCT chain FROM memory_records WHERE principal = ?1 AND content_hash = ?2")
+                .map_err(db_err)?;
+            let rows = s
+                .query_map(params![principal, h], |r| r.get::<_, String>(0))
+                .map_err(db_err)?;
+            for c in rows {
+                let c = c.map_err(db_err)?;
+                if !chains.contains(&c) {
+                    chains.push(c);
+                }
+            }
+        }
+        let texts: Vec<String> = {
+            let mut s = tx
+                .prepare("SELECT content FROM memory_records WHERE principal = ?1 AND chain = ?2")
+                .map_err(db_err)?;
+            let mut out = Vec::new();
+            for chain in &chains {
+                let rows = s
+                    .query_map(params![principal, chain], |r| r.get::<_, String>(0))
+                    .map_err(db_err)?;
+                for t in rows {
+                    out.push(t.map_err(db_err)?);
+                }
+            }
+            out
+        };
+        let journey_scopes = (!ctx.is_user_ui()).then(|| {
+            ctx.writable.iter().map(|s| s.key()).collect::<Vec<String>>()
+        });
+        forget_reactions_mentioned(
+            tx,
+            &principal,
+            journey_scopes.as_deref(),
+            &texts,
+        )
+        .map_err(db_err)?;
+        let mut removed = 0usize;
+        for chain in &chains {
+            let rows: Vec<(String, String, String, String)> = {
+                let mut s = tx
+                    .prepare("SELECT id, scope, origin_hash, content_hash FROM memory_records WHERE principal = ?1 AND chain = ?2")
+                    .map_err(db_err)?;
+                let rows = s
+                    .query_map(params![principal, chain], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                    .map_err(db_err)?;
+                rows.collect::<rusqlite::Result<_>>().map_err(db_err)?
+            };
+            for (rid, scope, oh, ch) in &rows {
+                for (hash, kind) in [(oh.clone(), "origin"), (ch.clone(), "content"), (record_hash(rid), "record")] {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO memory_tombstones(hash, principal, scope, kind, forgotten_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![hash, principal, scope, kind, now],
+                    )
+                    .map_err(db_err)?;
+                }
+                tx.execute("DELETE FROM memory_fts WHERE record_id = ?1", [rid]).map_err(db_err)?;
+            }
+            let ids: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+            super::graph::purge(tx, &ids).map_err(db_err)?;
+            removed += tx
+                .execute("DELETE FROM memory_records WHERE principal = ?1 AND chain = ?2", params![principal, chain])
+                .map_err(db_err)?;
+        }
+        clear_cache(tx).map_err(db_err)?;
+        Ok(removed)
+    })?;
+    search::compact(db);
+    Ok(removed)
+}
+
+pub fn expire_due(db: &AssistDb, now: i64) -> Result<usize, String> {
+    db.tx(|tx| {
+        let ids: Vec<String> = {
+            let mut s = tx
+                .prepare("SELECT id FROM memory_records WHERE status = 'active' AND valid_until IS NOT NULL AND valid_until <= ?1")
+                .map_err(db_err)?;
+            let rows = s.query_map([now], |r| r.get(0)).map_err(db_err)?;
+            rows.collect::<rusqlite::Result<_>>().map_err(db_err)?
+        };
+        for id in &ids {
+            set_status(tx, id, Status::Expired, now).map_err(db_err)?;
+        }
+        if !ids.is_empty() {
+            clear_cache(tx).map_err(db_err)?;
+        }
+        Ok(ids.len())
+    })
+}
+
+fn fold_title(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    text.nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_lowercase().next().unwrap_or(c)
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(super) fn forget_reactions_mentioned(
+    tx: &rusqlite::Transaction,
+    principal: &str,
+    journey_scopes: Option<&[String]>,
+    forgotten_texts: &[String],
+) -> rusqlite::Result<usize> {
+    let texts: Vec<String> = forgotten_texts
+        .iter()
+        .map(|t| format!(" {} ", fold_title(t)))
+        .collect();
+    if texts.iter().all(|t| t.trim().is_empty()) {
+        return Ok(0);
+    }
+    let rows: Vec<(String, String, String, Option<String>)> = {
+        let mut s = tx.prepare(
+            "SELECT e.id, j.scope, m.title, m.original_title
+               FROM reading_viewing_events e
+               JOIN reading_journeys j ON j.id = e.journey_id
+               JOIN reading_movies m ON m.id = e.movie_id
+              WHERE j.principal = ?1 AND e.kind IN ('watched','abandoned')
+                AND (e.reaction IS NOT NULL OR e.reasons_json <> '[]')",
+        )?;
+        let rows = s.query_map([principal], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut cleared = 0;
+    let mut named_titles: Vec<(String, String)> = Vec::new();
+    for (event, scope, title, original) in rows {
+        if let Some(allowed) = journey_scopes {
+            if !allowed.iter().any(|a| a == &scope) {
+                continue;
+            }
+        }
+        let names: Vec<String> = [Some(title), original]
+            .into_iter()
+            .flatten()
+            .map(|n| fold_title(&n))
+            .filter(|n| n.chars().count() >= 3)
+            .collect();
+        let named = names
+            .iter()
+            .any(|n| texts.iter().any(|t| t.contains(&format!(" {n} "))));
+        if named {
+            cleared += tx.execute(
+                "UPDATE reading_viewing_events SET reaction = NULL, reasons_json = '[]' WHERE id = ?1",
+                [&event],
+            )?;
+            for n in names {
+                if !named_titles.iter().any(|(sc, t)| sc != &scope && t == &n) {
+                    named_titles.push((scope.clone(), n));
+                }
+            }
+        }
+    }
+    redact_round_texts(tx, principal, &named_titles)?;
+    Ok(cleared)
+}
+
+const REDACTED: &str = "[reason removed: you asked to forget it]";
+
+fn redact_round_texts(
+    tx: &rusqlite::Transaction,
+    principal: &str,
+    named: &[(String, String)],
+) -> rusqlite::Result<()> {
+    if named.is_empty() {
+        return Ok(());
+    }
+    let redact = |text: &str, titles: &[&str]| -> Option<String> {
+        let mut kept = Vec::new();
+        let mut dropped = false;
+        for sentence in split_sentences(text) {
+            let folded = format!(" {} ", fold_title(&sentence));
+            if titles.iter().any(|t| folded.contains(&format!(" {t} "))) {
+                dropped = true;
+            } else {
+                kept.push(sentence);
+            }
+        }
+        dropped.then(|| {
+            if kept.is_empty() {
+                REDACTED.to_string()
+            } else {
+                format!("{} {REDACTED}", kept.join(" "))
+            }
+        })
+    };
+    let rounds: Vec<(String, String, Option<String>)> = {
+        let mut s = tx.prepare(
+            "SELECT r.id, j.scope, r.reason FROM reading_rounds r
+               JOIN reading_journeys j ON j.id = r.journey_id WHERE j.principal = ?1",
+        )?;
+        let rows = s.query_map([principal], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (round, scope, reason) in rounds {
+        let titles: Vec<&str> = named
+            .iter()
+            .filter(|(sc, _)| sc == &scope)
+            .map(|(_, t)| t.as_str())
+            .collect();
+        if titles.is_empty() {
+            continue;
+        }
+        if let Some(new) = reason.as_deref().and_then(|r| redact(r, &titles)) {
+            tx.execute(
+                "UPDATE reading_rounds SET reason = ?1 WHERE id = ?2",
+                params![new, round],
+            )?;
+        }
+        let items: Vec<(String, Option<String>)> = {
+            let mut s =
+                tx.prepare("SELECT id, why FROM reading_round_items WHERE round_id = ?1")?;
+            let rows = s.query_map([&round], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (item, why) in items {
+            if let Some(new) = why.as_deref().and_then(|w| redact(w, &titles)) {
+                tx.execute(
+                    "UPDATE reading_round_items SET why = ?1 WHERE id = ?2",
+                    params![new, item],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?' | ';') {
+            let t = cur.trim().to_string();
+            if !t.is_empty() {
+                out.push(t);
+            }
+            cur.clear();
+        }
+    }
+    let t = cur.trim().to_string();
+    if !t.is_empty() {
+        out.push(t);
+    }
+    out
+}

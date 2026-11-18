@@ -1,0 +1,63 @@
+import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { AgentKind } from '../model/types';
+
+export type RoleScope = 'workspace' | 'global';
+
+export interface Role {
+  id: string;
+  name: string;
+  prompt: string;
+  summary?: string;
+  icon?: string;
+  color?: string;
+  agent?: AgentKind;
+  workspaceId?: string;
+  builtin?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface RoleInfo extends Role {
+  scope: RoleScope;
+  terminalsInUse: string[];
+}
+
+export interface RoleInput {
+  id?: string;
+  name: string;
+  prompt: string;
+  summary?: string;
+  icon?: string;
+  color?: string;
+  agent?: AgentKind;
+}
+
+export interface RoleEvent {
+  workspaceId: string;
+  floorId: string;
+  nodeId: string;
+  terminalId: string;
+  roleId?: string;
+  restart: boolean;
+}
+
+const ROLE_EVENT = 'canvas://role';
+
+export const rolesList = (workspaceId: string) => invoke<RoleInfo[]>('canvas_roles_list', { workspaceId });
+export const rolesSave = (workspaceId: string, scope: RoleScope, input: RoleInput) =>
+  invoke<Role>('canvas_roles_save', { workspaceId, scope, input });
+export const rolesDelete = (workspaceId: string, roleId: string, scope: RoleScope, force = false) =>
+  invoke<void>('canvas_roles_delete', { workspaceId, roleId, scope, force });
+export const rolesAssign = (workspaceId: string, nodeId: string, roleId: string | null) =>
+  invoke<Role | null>('canvas_roles_assign', { workspaceId, nodeId, roleId });
+export const rolesDiscover = (workspaceId: string, dir?: string) =>
+  invoke<Role[]>('canvas_roles_discover', { workspaceId, dir: dir ?? null });
+export const rolesImport = (workspaceId: string, names: string[], dir?: string) =>
+  invoke<Role[]>('canvas_roles_import', { workspaceId, dir: dir ?? null, names });
+
+export function onRoleEvent(cb: (e: RoleEvent) => void): Promise<UnlistenFn> {
+  return listen<RoleEvent>(ROLE_EVENT, (e) => cb(e.payload));
+}
+
+export { errorText } from '../term/client';

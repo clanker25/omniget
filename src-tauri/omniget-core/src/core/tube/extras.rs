@@ -1,0 +1,137 @@
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+use super::model::{DeArrow, Ryd, SbAction, SbCategory, SbSegment};
+
+const SB_ACTIONS: &str = r#"["skip","mute","full","poi","chapter"]"#;
+
+pub fn sb_url(server: &str, video_id: &str, categories: &[&str]) -> String {
+    let hash = hex::encode(Sha256::digest(video_id.as_bytes()));
+    let cats = serde_json::to_string(categories).unwrap_or_else(|_| "[]".into());
+    format!(
+        "{}/api/skipSegments/{}?categories={}&actionTypes={}",
+        server.trim_end_matches('/'),
+        &hash[..4],
+        urlencoding::encode(&cats),
+        urlencoding::encode(SB_ACTIONS)
+    )
+}
+
+fn from_str<T: serde::de::DeserializeOwned>(s: &str) -> Option<T> {
+    serde_json::from_value(Value::String(s.to_string())).ok()
+}
+
+pub fn parse_sb(json: &Value, video_id: &str) -> Vec<SbSegment> {
+    let Some(list) = json.as_array() else {
+        return Vec::new();
+    };
+    let mut out: Vec<SbSegment> = list
+        .iter()
+        .filter(|v| v["videoID"].as_str() == Some(video_id))
+        .flat_map(|v| v["segments"].as_array().cloned().unwrap_or_default())
+        .filter_map(|s| {
+            let category: SbCategory = from_str(s["category"].as_str()?)?;
+            let action: SbAction = from_str(s["actionType"].as_str().unwrap_or("skip"))?;
+            let seg = s["segment"].as_array()?;
+            let start_s = seg.first()?.as_f64()?;
+            let end_s = seg.get(1)?.as_f64()?;
+            if end_s < start_s {
+                return None;
+            }
+            Some(SbSegment {
+                uuid: s["UUID"].as_str().unwrap_or_default().to_string(),
+                category,
+                action,
+                start_s,
+                end_s,
+                votes: s["votes"].as_i64().unwrap_or(0) as i32,
+                description: s["description"]
+                    .as_str()
+                    .filter(|d| !d.is_empty())
+                    .map(str::to_string),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
+    out
+}
+
+pub fn dearrow_url(video_id: &str) -> String {
+    format!(
+        "https://sponsor.ajay.app/api/branding?videoID={}",
+        urlencoding::encode(video_id)
+    )
+}
+
+fn clean_title(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    let mut prev_space = true;
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '>' && prev_space && chars.peek().is_some_and(|n| !n.is_whitespace()) {
+            continue;
+        }
+        prev_space = c.is_whitespace();
+        out.push(c);
+    }
+    out.trim().to_string()
+}
+
+fn trusted(v: &Value) -> bool {
+    v["locked"].as_bool().unwrap_or(false) || v["votes"].as_i64().unwrap_or(0) >= 0
+}
+
+pub fn parse_dearrow(json: &Value, video_id: &str) -> DeArrow {
+    let title = json["titles"]
+        .as_array()
+        .and_then(|a| a.iter().find(|t| trusted(t)))
+        .filter(|t| !t["original"].as_bool().unwrap_or(false))
+        .and_then(|t| t["title"].as_str())
+        .map(clean_title)
+        .filter(|t| !t.is_empty());
+    let thumbs = json["thumbnails"].as_array();
+    let mut time = thumbs
+        .and_then(|a| a.iter().find(|t| trusted(t)))
+        .filter(|t| !t["original"].as_bool().unwrap_or(false))
+        .and_then(|t| t["timestamp"].as_f64());
+    if time.is_none() && thumbs.is_none_or(|a| a.is_empty()) {
+        if let (Some(r), Some(d)) = (
+            json["randomTime"].as_f64(),
+            json["videoDuration"].as_f64().filter(|d| *d > 0.0),
+        ) {
+            time = Some(r * d);
+        }
+    }
+    DeArrow {
+        title,
+        thumb_time_s: time,
+        thumb_url: time.map(|t| {
+            format!(
+                "https://dearrow-thumb.ajay.app/api/v1/getThumbnail?videoID={}&time={}",
+                urlencoding::encode(video_id),
+                t
+            )
+        }),
+    }
+}
+
+pub fn ryd_url(video_id: &str) -> String {
+    format!(
+        "https://returnyoutubedislikeapi.com/votes?videoId={}",
+        urlencoding::encode(video_id)
+    )
+}
+
+pub fn parse_ryd(json: &Value) -> Option<Ryd> {
+    let n = |k: &str| {
+        json[k]
+            .as_u64()
+            .or_else(|| json[k].as_f64().map(|f| f as u64))
+    };
+    Some(Ryd {
+        likes: n("likes")?,
+        dislikes: n("dislikes")?,
+        rating: json["rating"].as_f64().unwrap_or(0.0),
+        view_count: n("viewCount").unwrap_or(0),
+    })
+}
